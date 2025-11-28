@@ -5,3 +5,5 @@ This project delivers a high-performance, RTOS-based avionics flight computer fo
 
 20240409 박재영
 20250142 이야호
+
+2025.11.18
