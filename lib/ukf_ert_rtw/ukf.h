@@ -7,9 +7,9 @@
 //
 // Code generated for Simulink model 'ukf'.
 //
-// Model version                  : 1.31
+// Model version                  : 1.32
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Sun Nov  9 20:56:38 2025
+// C/C++ source code generated on : Tue Dec  2 15:14:53 2025
 //
 // Target selection: ert.tlc
 // Embedded hardware selection: ARM Compatible->ARM Cortex-M
@@ -23,7 +23,6 @@
 #include <cmath>
 #include "rtwtypes.h"
 #include "coder_bounded_array.h"
-#define ukf_M                          (rtM)
 
 extern "C"
 {

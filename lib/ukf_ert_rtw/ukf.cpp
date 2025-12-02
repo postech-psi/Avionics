@@ -7,9 +7,9 @@
 //
 // Code generated for Simulink model 'ukf'.
 //
-// Model version                  : 1.31
+// Model version                  : 1.32
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Sun Nov  9 20:56:38 2025
+// C/C++ source code generated on : Tue Dec  2 15:14:53 2025
 //
 // Target selection: ert.tlc
 // Embedded hardware selection: ARM Compatible->ARM Cortex-M
@@ -234,8 +234,8 @@ void kf::step()
     for (nz = 0; nz < 5; nz++) {
       idxAjj = nz << 1;
       diff_idx_0 = rtDW.sigma_points[idxAjj + 1];
-      ssq = (rtU.accel_z_in - 9.81) - 0.6125 * diff_idx_0 * std::abs(diff_idx_0)
-        * 0.62 * 0.00725 / 4.25;
+      ssq = rtU.accel_z_in - 0.6125 * diff_idx_0 * std::abs(diff_idx_0) * 0.62 *
+        0.00725 / 4.25;
       propagated_points = (diff_idx_0 * 0.02 + rtDW.sigma_points[idxAjj]) + 0.5 *
         ssq * 0.0004;
       rtDW.propagated_points[idxAjj] = propagated_points;
