@@ -7,9 +7,9 @@
 //
 // Code generated for Simulink model 'ukf'.
 //
-// Model version                  : 1.32
+// Model version                  : 1.31
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Tue Dec  2 15:14:53 2025
+// C/C++ source code generated on : Sun Nov  9 20:56:38 2025
 //
 // Target selection: ert.tlc
 // Embedded hardware selection: ARM Compatible->ARM Cortex-M
@@ -23,6 +23,7 @@
 #include <cmath>
 #include "rtwtypes.h"
 #include "coder_bounded_array.h"
+#define ukf_M                          (rtM)
 
 extern "C"
 {
@@ -62,7 +63,11 @@ class kf final
     real_T K[9];
     real_T dv[9];
     boolean_T b_x_data[50];
-    boolean_T is_initialized_not_empty;// '<Root>/Kalman_Filter'
+    boolean_T is_initialized_not_empty;
+    real_T time_buffer[50];
+    real_T alt_buffer[50];
+    int buffer_count;
+// int count;  / '<Root>/Kalman_Filter'
   };
 
   // External inputs (root inport signals with default storage)
