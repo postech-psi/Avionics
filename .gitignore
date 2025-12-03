@@ -22,3 +22,18 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# PlatformIO libraries are kept in lib/ folder and committed to git
+# This ensures version control and offline builds
+
