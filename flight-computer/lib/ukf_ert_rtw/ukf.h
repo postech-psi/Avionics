@@ -63,7 +63,11 @@ class kf final
     real_T K[9];
     real_T dv[9];
     boolean_T b_x_data[50];
-    boolean_T is_initialized_not_empty;// '<Root>/Kalman_Filter'
+    boolean_T is_initialized_not_empty;
+    real_T time_buffer[50];
+    real_T alt_buffer[50];
+    int buffer_count;
+// int count;  / '<Root>/Kalman_Filter'
   };
 
   // External inputs (root inport signals with default storage)

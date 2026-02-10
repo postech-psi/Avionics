@@ -275,10 +275,10 @@ void Decision() {
             float euler_y         = dmail->euler[1];
             float z_accel         = dmail->accel[2];
             float Decision_alt    = dmail->altitude;
-            float alt_kalman      = dmail->kalman[0];
+            //float alt_kalman      = dmail->kalman[0];
             float vz_kalman       = dmail->kalman[1];
-            float pre_apogee      = dmail->kalman[2];
-            float r2_apogee       = dmail->kalman[3];
+            //float pre_apogee      = dmail->kalman[2];
+            //float r2_apogee       = dmail->kalman[3];
             decisionMail.free(dmail);
             FlightState localState;
             {
