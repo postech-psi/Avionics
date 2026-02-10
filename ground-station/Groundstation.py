@@ -1,3 +1,5 @@
+#20250806_1540 업데이트
+
 import sys, serial, struct, threading, time, datetime, os
 import numpy as np
 from PyQt5 import QtWidgets, QtCore
@@ -451,4 +453,3 @@ if __name__ == "__main__":
     keyboard_thread.start()
 
     sys.exit(app.exec_())
-#20250806_1540 업데이트

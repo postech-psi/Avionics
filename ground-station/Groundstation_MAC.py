@@ -9,6 +9,7 @@ from serial.tools import list_ports
 
 # === Global logging control ===
 logging_enabled = False
+
 log_file = None
 log_lock = threading.Lock()
 
@@ -121,7 +122,9 @@ class RocketViewer(QtWidgets.QMainWindow):
             self.view.addItem(line)
 
     def load_rocket(self, path):
-        stl = mesh.Mesh.from_file(path)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        stl_path = path if os.path.isabs(path) else os.path.join(base_dir, path)
+        stl = mesh.Mesh.from_file(stl_path)
         verts = stl.vectors.reshape(-1, 3)
         faces = np.arange(len(verts)).reshape(-1, 3)
         verts -= verts.mean(axis=0)
@@ -238,7 +241,9 @@ class RocketPathViewer(QtWidgets.QMainWindow):
         self.view.addItem(self.path_line)
 
     def init_position_marker(self, stl_path):
-        stl = mesh.Mesh.from_file(stl_path)
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        marker_path = stl_path if os.path.isabs(stl_path) else os.path.join(base_dir, stl_path)
+        stl = mesh.Mesh.from_file(marker_path)
         verts = stl.vectors.reshape(-1, 3)
         faces = np.arange(len(verts)).reshape(-1, 3)
         verts -= verts.mean(axis=0)
