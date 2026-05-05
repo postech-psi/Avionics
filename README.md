@@ -67,3 +67,6 @@ Avionics/
 - numpy-stl
 - scipy
 - pyserial
+
+
+세훈 바보~
