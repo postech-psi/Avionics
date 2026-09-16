@@ -10,7 +10,11 @@ Only the firmware project was imported into `flight-computer/`. The existing gro
 
 ## Legacy versions
 
-Git history is retained; no history rewrite or duplicate legacy source directory is needed.
+The original single-core firmware is preserved directly in
+[`flight-computer/legacy/`](../flight-computer/legacy/README.md), including its
+original source, libraries, and PlatformIO configuration. It builds as a
+separate project and is excluded from the current firmware build. Git history
+and the recovery tags are also retained.
 
 | Local tag | Contents |
 |---|---|

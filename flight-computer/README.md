@@ -7,6 +7,9 @@
 > backup. A usable sample resets this timer; isolated gaps retain the existing
 > 500 ms recovery blanking. SD replay now decodes the health-note tokens.
 > See [migration, tests, and legacy recovery](../docs/MIGRATION-2026.md).
+> The original single-core project is preserved in [`legacy/`](legacy/README.md)
+> with its own libraries and build configuration; the default build uses the
+> current dual-core sources only.
 
 Arduino Portenta H7(STM32H747)의 두 코어를 나눠 쓰는 로켓 비행 컴퓨터 펌웨어.
 

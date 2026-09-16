@@ -12,6 +12,7 @@ Avionics/
 │   ├── src/m7/        # Flight control (100Hz loop, 50Hz UKF)
 │   ├── src/m4/        # SD logging (100Hz) and telemetry (25Hz)
 │   ├── lib/            # Custom libraries (ukf_ert_rtw)
+│   ├── legacy/         # Original single-core firmware, separate PlatformIO project
 │   └── platformio.ini  # PlatformIO configuration
 └── ground-station/     # Python ground station
     ├── Groundstation.py         # main GUI with live map ground-track tracking
@@ -111,3 +112,7 @@ The flight scenarios require a C++17 host compiler (`g++`, `clang++`, or
 `cl`). On Windows, run them from an **x64 Native Tools Command Prompt for
 VS 2022** so MSVC's include/library paths are configured. Tests fake time
 and hardware while compiling the production decision and cadence logic.
+
+The original single-core firmware is also available directly in
+[`flight-computer/legacy/`](flight-computer/legacy/README.md), including its
+original libraries and build configuration.
