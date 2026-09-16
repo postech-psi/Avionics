@@ -61,6 +61,13 @@ public:
   /// Perform a reading in blocking mode
   bool performReading(void);
 
+  // --- [로컬 추가] normal(연속) 모드 + 논블로킹 읽기 (100Hz 루프용) ---
+  // 오버샘플링/IIR은 기존 setter로 먼저 설정한 뒤 호출할 것.
+  /// 연속(normal) 모드로 진입. odr은 BMP3_ODR_* (예: BMP3_ODR_50_HZ)
+  bool setupNormalMode(uint8_t odr);
+  /// 새 샘플이 있으면 pressure/temperature 갱신 후 true, 없으면 false(블로킹 없음)
+  bool readNonBlocking(void);
+
   /// Temperature (Celsius) assigned after calling performReading()
   double temperature;
   /// Pressure (Pascals) assigned after calling performReading()

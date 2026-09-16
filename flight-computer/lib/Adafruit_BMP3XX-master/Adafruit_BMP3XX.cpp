@@ -390,6 +390,60 @@ bool Adafruit_BMP3XX::performReading(void) {
 
 /**************************************************************************/
 /*!
+    @brief  [로컬 추가] 연속(normal) 모드로 진입한다.
+            오버샘플링/IIR은 기존 setter로 먼저 설정한 뒤 호출할 것.
+            이후 센서는 ODR 주기로 백그라운드 샘플링하며,
+            readNonBlocking()으로 블로킹 없이 최신값을 읽는다.
+    @param  odr  BMP3_ODR_* (예: BMP3_ODR_50_HZ)
+    @return 설정 성공 시 true
+*/
+/**************************************************************************/
+bool Adafruit_BMP3XX::setupNormalMode(uint8_t odr) {
+  g_i2c_dev = i2c_dev;
+  g_spi_dev = spi_dev;
+
+  the_sensor.settings.temp_en = BMP3_ENABLE;
+  the_sensor.settings.press_en = BMP3_ENABLE;
+  the_sensor.settings.odr_filter.odr = odr;
+
+  // 현재 설정된 오버샘플링/IIR/ODR을 모두 적용
+  uint16_t settings_sel = BMP3_SEL_TEMP_EN | BMP3_SEL_PRESS_EN |
+                          BMP3_SEL_TEMP_OS | BMP3_SEL_PRESS_OS |
+                          BMP3_SEL_IIR_FILTER | BMP3_SEL_ODR;
+  if (bmp3_set_sensor_settings(settings_sel, &the_sensor) != BMP3_OK)
+    return false;
+
+  the_sensor.settings.op_mode = BMP3_MODE_NORMAL;
+  return (bmp3_set_op_mode(&the_sensor) == BMP3_OK);
+}
+
+/**************************************************************************/
+/*!
+    @brief  [로컬 추가] 논블로킹 읽기. 새 데이터(DRDY)가 준비됐을 때만
+            pressure/temperature를 갱신한다. 변환을 트리거하거나 대기하지 않음.
+    @return 새 샘플을 읽었으면 true, 아직 없으면 false(이전 값 유지)
+*/
+/**************************************************************************/
+bool Adafruit_BMP3XX::readNonBlocking(void) {
+  g_i2c_dev = i2c_dev;
+  g_spi_dev = spi_dev;
+
+  if (bmp3_get_status(&the_sensor) != BMP3_OK)
+    return false;
+  if (!the_sensor.status.sensor.drdy_press)
+    return false;  // 아직 새 샘플 없음
+
+  struct bmp3_data data;
+  if (bmp3_get_sensor_data(BMP3_PRESS | BMP3_TEMP, &data, &the_sensor) != BMP3_OK)
+    return false;
+
+  temperature = data.temperature;
+  pressure = data.pressure;
+  return true;
+}
+
+/**************************************************************************/
+/*!
     @brief  Setter for Temperature oversampling
     @param  oversample Oversampling setting, can be BMP3_NO_OVERSAMPLING,
    BMP3_OVERSAMPLING_2X, BMP3_OVERSAMPLING_4X, BMP3_OVERSAMPLING_8X,

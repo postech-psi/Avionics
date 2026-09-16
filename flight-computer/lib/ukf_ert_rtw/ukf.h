@@ -27,8 +27,8 @@
 
 extern "C"
 {
-  static real_T rtGetNaN(void);
-  static real32_T rtGetNaNF(void);
+  // static real_T rtGetNaN(void);      // 미사용
+  // static real32_T rtGetNaNF(void);   // 미사용
 }                                      // extern "C"
 
 extern "C"
@@ -39,10 +39,10 @@ extern "C"
   extern real32_T rtInfF;
   extern real32_T rtMinusInfF;
   extern real32_T rtNaNF;
-  static boolean_T rtIsInf(real_T value);
-  static boolean_T rtIsInfF(real32_T value);
-  static boolean_T rtIsNaN(real_T value);
-  static boolean_T rtIsNaNF(real32_T value);
+  // static boolean_T rtIsInf(real_T value);      // 미사용
+  // static boolean_T rtIsInfF(real32_T value);   // 미사용
+  // static boolean_T rtIsNaN(real_T value);      // 미사용
+  // static boolean_T rtIsNaNF(real32_T value);   // 미사용
 }                                      // extern "C"
 
 // Class declaration for model ukf
@@ -63,11 +63,7 @@ class kf final
     real_T K[9];
     real_T dv[9];
     boolean_T b_x_data[50];
-    boolean_T is_initialized_not_empty;
-    real_T time_buffer[50];
-    real_T alt_buffer[50];
-    int buffer_count;
-// int count;  / '<Root>/Kalman_Filter'
+    boolean_T is_initialized_not_empty;// '<Root>/Kalman_Filter'
   };
 
   // External inputs (root inport signals with default storage)
