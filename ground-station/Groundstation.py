@@ -2001,18 +2001,32 @@ RAW_CSV_MAP = {
 
 
 def _raw_health(frame, note):
-    """raw CSV에는 health 바이트가 없어서 값에서 되짚어 만든다.
+    """Decode M4 healthNote tokens; infer values only for older unannotated logs."""
+    # A dead sensor retains its previous values. Explicit notes, rather than
+    # coordinates/pressure, determine health for the current firmware's CSV.
+    clear_bits = {
+        "imu_dead": 0x05,       # IMU fresh + alive
+        "imu_stale": 0x01,
+        "baro_dead": 0x0A,      # baro fresh + alive
+        "baro_stale": 0x02,
+        "gnss_dead": 0x10,
+        "no_baro_ref": 0x20,
+        "vz_off": 0xC0,         # trusted + usable
+        "vz_settle": 0x80,      # temporarily unusable; still trusted
+    }
+    tokens = {token.strip() for token in note.split("|")}
+    if "ok" in tokens or tokens.intersection(clear_bits):
+        health = 0xFF
+        for token in tokens:
+            health &= ~clear_bits.get(token, 0)
+        return health
 
-    없다고 0을 쓰면 헬스 패널이 전부 빨갛게 떠서 오히려 오해를 부른다.
-    센서 값이 들어와 있으면 살아있는 것으로 보고, vz 비트만 note로 가른다.
-    """
+    # Legacy files without encoded health keep the previous best-effort view.
     health = 0x01 | 0x02 | 0x04 | 0x08          # imu/baro fresh + alive
     if frame.get("lat") or frame.get("lon"):
         health |= 0x10                          # gnss_alive
     if frame.get("pressure") == frame.get("pressure"):
         health |= 0x20                          # baro_ref
-    if note == "ok":                            # vz_settle 구간은 아직 못 믿는다
-        health |= 0x40 | 0x80
     return health
 
 

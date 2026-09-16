@@ -1,5 +1,13 @@
 # PSI AVIONICS 2026 — Portenta H7 듀얼코어 로켓 에비오닉스
 
+> **Repository migration, 2026-09-17:** imported the August 8 package.
+> ST STM32 19.5.0 and Arduino Mbed 4.5.0 are pinned. After the five-second
+> deployment lockout, velocity that remains unusable for **1000 ms continuously**
+> now permanently disables its primary path, allowing the healthy IMU tilt
+> backup. A usable sample resets this timer; isolated gaps retain the existing
+> 500 ms recovery blanking. SD replay now decodes the health-note tokens.
+> See [migration, tests, and legacy recovery](../docs/MIGRATION-2026.md).
+
 Arduino Portenta H7(STM32H747)의 두 코어를 나눠 쓰는 로켓 비행 컴퓨터 펌웨어.
 
 | 코어 | 파일 | 역할 |
@@ -629,7 +637,11 @@ tilt와 14초는 백업일 뿐이라, 60ms 딸꾹질 하나에 버리면 안 된
 `vzUsableNow()` = trusted && cadence OK && **IMU 30ms 이내** && 기압 60ms 이내 &&
 `isfinite` && |vz| < 200 && 블랭킹 해제 — **7항 AND**. IMU가 죽진 않았지만 값이 낡은
 30~500ms 구간에는 vz 투표가 일시 정지되고(note `vz_settle`), UKF가 가속도 0으로
-절름거리는 동안의 추정치는 표가 되지 못한다. 신선해지면 자동 재개된다(라치 아님).
+절름거리는 동안의 추정치는 표가 되지 못한다. 짧은 공백은 신선해지면 자동 재개된다.
+단, 5초 전개 잠금 해제 후 `vzUsableNow()`가 **1000ms 연속 거짓**이면
+`vzTrusted=false`로 영구 차단하여 tilt 백업에 권한을 넘긴다. 40ms 주기처럼
+cadence 통계에서 제외되는 지속 저하 및 비유한 속도도 이 감시가 처리한다.
+중간에 usable이 참이면 연속 시간은 리셋된다. 복구 후에도 영구 차단은 유지한다.
 
 과거의 **상승(+3m/s 연속 10루프) 확인 무장 항은 2026-08-08에 제거**했다(팀 결정).
 발사 직후 구간은 5초 락이 대신 지킨다. 대가: "상승을 한 번도 안 만드는 하강-고정
@@ -762,6 +774,7 @@ staticLanded = (!moving)가 2500표 중 1500표 ≈ 15초 (최근 25초 창 안�
 | `BARO_CTRL_FRESH_MS` | 60 | **판정용** 기압 신선도(3주기 = 60ms) |
 | `VZ_BARO_GAP_MS` | 200 | 이 이상 공백이면 vz 경로 영구 차단 |
 | `VZ_SETTLE_MS` | 500 | 공백 후 vz 투표 블랭킹 시간 |
+| `VZ_UNUSABLE_TIMEOUT_MS` | 1000 | 5초 잠금 해제 후 연속 unusable 시간 상한. 초과 시 vz 영구 차단, tilt 백업 허용 |
 | `CADENCE_ARM_N` | 100 | vz 무장에 필요한 깨끗한 간격 수(≈2초) |
 | `CADENCE_BLOCK_N` | 50 | 무장 후 롤링 재검사 블록 크기(≈1초) |
 | `CADENCE_MEAN_LO/HI_MS` | 17.5 / 22.5 | 무장·롤링 재검사의 허용 평균 밴드. 실측 BMP390 ODR 19.42ms(+3%, 발진기 공차)를 통과시키고 25%+ 저하(25/30ms)만 잡는다 |

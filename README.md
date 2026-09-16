@@ -1,13 +1,16 @@
 # Avionics Flight Software
 
-This project delivers a high-performance, RTOS-based avionics flight computer for the Arduino Portenta H7, designed for autonomous rocket recovery and telemetry. It integrates multi-sensor fusion—combining GNSS, IMU, and BMP3XX barometric data with an Unscented Kalman Filter (UKF)—to provide precise real-time state estimation and robust flight stage detection (Calibration, Prelaunch, Launch, Deploy, Landed). Featuring concurrent threads for decision-making and XBee telemetry transmission, the system ensures reliable parachute deployment based on acceleration, velocity, and orientation thresholds, meeting rigorous standards for stability and mission success.
+Dual-core rocket flight software for the Arduino Portenta H7. M7 runs sensor acquisition, IMU/barometer UKF estimation, flight-state decisions, and the parachute servo. M4 handles SD logging and XBee telemetry. GNSS coordinates and altitude are used for logging and recovery, not flight decisions.
+
+The flight computer is based on **PSI AVINICS 2026 (2), August 8, 2026**, migrated on September 17 with fixes for persistent velocity-path failure and SD-log health replay. See [migration and legacy recovery](docs/MIGRATION-2026.md) and the [firmware hardware/setup guide](flight-computer/README.md). The existing ground station, assets, and flight logs are preserved.
 
 ## Project Structure
 
 ```
 Avionics/
 ├── flight-computer/     # PlatformIO firmware project
-│   ├── src/            # Source code
+│   ├── src/m7/        # Flight control (100Hz loop, 50Hz UKF)
+│   ├── src/m4/        # SD logging (100Hz) and telemetry (25Hz)
 │   ├── lib/            # Custom libraries (ukf_ert_rtw)
 │   └── platformio.ini  # PlatformIO configuration
 └── ground-station/     # Python ground station
@@ -26,17 +29,22 @@ Avionics/
    - VS Code: Install the "PlatformIO IDE" extension
    - CLI: `pip install platformio`
 
-2. **Install Dependencies**:
+2. **Open the Firmware Project**:
    ```bash
    cd flight-computer
-   pio lib install  # Automatically installs libraries from platformio.ini
    ```
+   Libraries are vendored in `lib/`. Keep the custom BMP3XX driver: the
+   firmware requires its normal-mode and nonblocking-read additions.
+   PlatformIO downloads the pinned ST STM32 19.5.0 / Arduino Mbed 4.5.0 runtime.
 
 3. **Build and Upload**:
    ```bash
-   pio run -e portenta_h7_m7        # Build
-   pio run -e portenta_h7_m7 -t upload  # Upload to board
+   pio run                             # Build both M7 and M4
+   pio run -e portenta_h7_m4 -t upload   # Upload M4 FIRST
+   pio run -e portenta_h7_m7 -t upload   # Upload M7 SECOND
    ```
+   Confirm sensor configuration and servo geometry in the firmware guide
+   before uploading. Builds and host tests do not validate hardware behavior.
 
 ### Ground Station (Python)
 
@@ -72,11 +80,11 @@ Avionics/
 ## Dependencies
 
 ### Flight Computer
-- **PlatformIO libraries** (auto-installed via `lib_deps` in `platformio.ini`):
+- **Vendored libraries** (versioned in `flight-computer/lib/`):
   - Adafruit BMP3XX Library
   - Adafruit Unified Sensor
   - Adafruit BusIO
-  - Servo (Arduino framework built-in)
+  - Servo
 
 - **Custom libraries** (in `lib/` folder):
   - `ukf_ert_rtw/` - Unscented Kalman Filter implementation
@@ -88,3 +96,18 @@ Avionics/
 - numpy-stl
 - scipy
 - pyserial
+
+## Regression Checks
+
+From the repository root:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+python tests/run_flight_tests.py
+pio run -d flight-computer
+```
+
+The flight scenarios require a C++17 host compiler (`g++`, `clang++`, or
+`cl`). On Windows, run them from an **x64 Native Tools Command Prompt for
+VS 2022** so MSVC's include/library paths are configured. Tests fake time
+and hardware while compiling the production decision and cadence logic.

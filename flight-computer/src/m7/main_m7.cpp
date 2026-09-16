@@ -134,6 +134,9 @@ const uint32_t IMU_CTRL_FRESH_MS  = 30;
 const uint32_t BARO_CTRL_FRESH_MS = 60;
 const uint32_t VZ_BARO_GAP_MS     = 200;
 const uint32_t VZ_SETTLE_MS       = 500;
+// After the deploy lockout, sustained unusability must release the tilt backup.
+// Two settle periods allow an isolated short gap to recover without a latch.
+const uint32_t VZ_UNUSABLE_TIMEOUT_MS = 1000;
 const float    VZ_PLAUSIBLE_MAX   = 200.0f; // |vz| beyond this = filter divergence
 const uint16_t CADENCE_ARM_N       = 100;   // clean intervals to arm the vz path
 const uint16_t CADENCE_BLOCK_N     = 50;    // rolling re-check block size
@@ -549,6 +552,8 @@ void runDecision(SensorData& s) {
     static uint32_t Launch_Time = 0;
     static int      deployPhase = 0;    // 0 open, 1 hold+landing check, 2 closed
     static uint32_t deployTimer = 0;
+    static bool     vzUnavailableTracking = false;
+    static uint32_t vzUnavailableSince = 0;
 
     uint32_t now     = millis();
     float    z_accel = s.accel[2];
@@ -607,6 +612,23 @@ void runDecision(SensorData& s) {
                 logEvent("[WARN] vz deploy path disabled (IMU dead in flight)");
             }
             bool vzUsable = vzUsableNow(now, vz);   // ! same helper as sensorFlags
+            bool deployArmed = (s.time - Launch_Time) >= DEPLOY_LOCKOUT_MS;
+            // A 40ms stream can blank vz forever without ever reaching the
+            // cadence counter (only <=35ms intervals count). Persistent invalid
+            // velocity has the same effect. Bound either condition, then latch
+            // the primary off so recovery cannot steal authority back from tilt.
+            if (deployArmed && vzTrusted && !vzUsable) {
+                if (!vzUnavailableTracking) {
+                    vzUnavailableTracking = true;
+                    vzUnavailableSince = now;
+                } else if ((uint32_t)(now - vzUnavailableSince) >= VZ_UNUSABLE_TIMEOUT_MS) {
+                    vzTrusted = false;
+                    vwVz.reset();
+                    logEvent("[WARN] vz deploy path disabled (unusable for 1000ms)");
+                }
+            } else {
+                vzUnavailableTracking = false;
+            }
             bool vzPrimaryAvailable = baroRefValid && baroAlive && vzTrusted;
             if (vzVotePendingReset) {
                 vzVotePendingReset = false;
@@ -617,7 +639,6 @@ void runDecision(SensorData& s) {
             //    Exactly one voting path per loop; the idle ones hold zero
             //    votes. ALL paths stay locked for the first 5s of flight -
             //    burn-phase transients may not open the chute (README 6.7) ###
-            bool deployArmed = (s.time - Launch_Time) >= DEPLOY_LOCKOUT_MS;
             if (vzPrimaryAvailable) {
                 vwTilt.reset();
                 //### Deploy 1: primary falling speed (global Z velocity) ###
