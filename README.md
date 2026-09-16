@@ -11,7 +11,10 @@ Avionics/
 │   ├── lib/            # Custom libraries (ukf_ert_rtw)
 │   └── platformio.ini  # PlatformIO configuration
 └── ground-station/     # Python ground station
-    ├── Groundstation.py
+    ├── Groundstation.py         # main GUI with live map ground-track tracking
+    ├── Groundstation_nomap.py   # fallback GUI (no map) for when basemaps are unavailable
+    ├── fetch_basemap.py         # CLI tool to download satellite basemaps into basemaps/
+    ├── logs/                    # flight-log archive (committed); new logs also saved here
     └── requirements.txt
 ```
 
@@ -45,8 +48,26 @@ Avionics/
 
 2. **Run Ground Station**:
    ```bash
-   python Groundstation.py
+   python Groundstation.py          # with live map ground-track view
    ```
+   The map view falls back to a plain GRID when no basemaps are present, so it
+   runs out of the box. To enable satellite basemaps, download them **once** from
+   an internet-connected machine (imagery: VWorld / 국토교통부):
+   ```bash
+   python fetch_basemap.py site1    # 고흥만 항공센터
+   python fetch_basemap.py site2    # POSTECH 풍동동
+   # custom site: python fetch_basemap.py mysite --lat 34.61 --lon 127.21 --label "예비 발사장"
+   ```
+   This writes `basemaps/<site>.png` + `.json`, which the ground station reads
+   **offline** at runtime (no network needed on the field). Raw tiles are cached
+   in `tilecache/` to speed up any re-fetch. Both `basemaps/` and `tilecache/`
+   are git-ignored (large, regenerable) — run the fetch above to recreate them.
+
+   If you can't download maps, use the no-map fallback instead:
+   ```bash
+   python Groundstation_nomap.py
+   ```
+   Recorded flight logs are written to `ground-station/logs/`.
 
 ## Dependencies
 

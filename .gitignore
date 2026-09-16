@@ -23,6 +23,11 @@ Thumbs.db
 # Logs
 *.log
 
+# Ground station large map data (kept on disk, not committed)
+ground-station/basemaps/
+ground-station/tilecache/
+# Note: ground-station/logs/ IS committed (flight-log archive)
+
 # Python
 __pycache__/
 *.py[cod]
