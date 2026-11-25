@@ -110,14 +110,12 @@ void kf::binary_expand_op(real_T in1[10], int32_T in2, const real_T in3[2],
   in1[tmp_0 + 1] = in3[1] - in4[(in5 + 1 != 1) + tmp];
 }
 
-// Model step function
-void kf::step()
+// Local adaptations: variable-interval UKF only; apogee is outside this filter.
+void kf::step(real_T dt)
 {
   real_T Wc[5];
   real_T Wm[5];
   real_T P_minus[4];
-  real_T K[3];
-  real_T x[3];
   real_T P_minus_0;
   real_T P_minus_1;
   real_T Wc_0;
@@ -137,7 +135,7 @@ void kf::step()
   //   Inport: '<Root>/accel_z_in'
   //   Inport: '<Root>/baro_altitude_in'
 
-  if (!rtDW.is_initialized_not_empty) {
+  if (dt == 0.0 || !rtDW.is_initialized_not_empty) {
     rtDW.x_hat[0] = rtU.baro_altitude_in;
     rtDW.x_hat[1] = 0.0;
     rtDW.P_a[0] = 100.0;
@@ -145,6 +143,11 @@ void kf::step()
     rtDW.P_a[2] = 0.0;
     rtDW.P_a[3] = 100.0;
     rtDW.is_initialized_not_empty = true;
+  }
+  if (dt == 0.0) {
+    rtY.kf_altitude_out = rtDW.x_hat[0];
+    rtY.kf_velocity_out = rtNaN;
+    return;
   }
 
   Wm[0] = -999998.99997124437;
@@ -233,15 +236,17 @@ void kf::step()
 
     x_hat = 0.0;
     accumulatedData = 0.0;
+    const real_T halfDt = 0.5 * dt;
+    const real_T halfDt2 = halfDt * dt;
     for (nz = 0; nz < 5; nz++) {
       idxAjj = nz << 1;
       diff_idx_0 = rtDW.sigma_points[idxAjj + 1];
       ssq = (rtU.accel_z_in - 9.81) - 0.6125 * diff_idx_0 * std::abs(diff_idx_0)
         * 0.62 * 0.00725 / 4.25;
-      propagated_points = (diff_idx_0 * 0.02 + rtDW.sigma_points[idxAjj]) + 0.5 *
-        ssq * 0.0004;
+      propagated_points = (diff_idx_0 * dt + rtDW.sigma_points[idxAjj]) +
+        ssq * halfDt2;
       rtDW.propagated_points[idxAjj] = propagated_points;
-      ssq = ssq * 0.02 + diff_idx_0;
+      ssq = ssq * dt + diff_idx_0;
       rtDW.propagated_points[idxAjj + 1] = ssq;
       diff_idx_0 = Wm[nz];
       x_hat += propagated_points * diff_idx_0;
@@ -252,10 +257,13 @@ void kf::step()
     rtDW.x_hat[0] = x_hat;
     x_hat = rtDW.x_hat[0];
     accumulatedData = rtDW.x_hat[1];
-    P_minus_0 = 2.9881050105278437E-5;
-    ssq = 0.0029881050105278442;
-    propagated_points = 0.0029881050105278442;
-    P_minus_1 = 0.29881050105278439;
+    // Q = G * var(a) * G', G = [dt^2/2, dt] for acceleration error held
+    // over the interval. Keep the original velocity variance at dt = 20 ms.
+    const real_T dtRatio = dt * 50.0;
+    P_minus_1 = 0.29881050105278439 * dtRatio * dtRatio;
+    ssq = halfDt * P_minus_1;
+    propagated_points = ssq;
+    P_minus_0 = halfDt * ssq;
     for (nz = 0; nz < 5; nz++) {
       idxAjj = nz << 1;
       diff_idx_0 = rtDW.propagated_points[idxAjj] - x_hat;
@@ -294,140 +302,8 @@ void kf::step()
 
   // Outport: '<Root>/kf_altitude_out'
   rtY.kf_altitude_out = diff_idx_0;
-
-  // MATLAB Function: '<Root>/Apogee_predictor' incorporates:
-  //   Inport: '<Root>/current_time_in'
-
-  x[0] = rtU.current_time_in * rtU.current_time_in;
-  x[1] = rtU.current_time_in;
-  x[2] = 1.0;
-  propagated_points = 0.0;
-  for (nz = 0; nz < 3; nz++) {
-    propagated_points += ((rtDW.P_g[3 * nz + 1] * rtU.current_time_in +
-      rtDW.P_g[3 * nz] * x[0]) + rtDW.P_g[3 * nz + 2]) * x[nz];
-  }
-
-  ssq = 0.0;
-  for (nz = 0; nz < 3; nz++) {
-    K[nz] = ((rtDW.P_g[nz + 3] * rtU.current_time_in + rtDW.P_g[nz] * x[0]) +
-             rtDW.P_g[nz + 6]) / (propagated_points + 0.965);
-    ssq += x[nz] * rtDW.theta[nz];
-  }
-
-  ssq = diff_idx_0 - ssq;
-  for (nz = 0; nz < 3; nz++) {
-    rtDW.theta[nz] += K[nz] * ssq;
-    propagated_points = x[nz];
-    rtDW.K[3 * nz] = K[0] * propagated_points;
-    rtDW.K[3 * nz + 1] = K[1] * propagated_points;
-    rtDW.K[3 * nz + 2] = K[2] * propagated_points;
-  }
-
-  for (nz = 0; nz < 3; nz++) {
-    ssq = rtDW.K[nz + 3];
-    propagated_points = rtDW.K[nz];
-    P_minus_1 = rtDW.K[nz + 6];
-    for (idxAjj = 0; idxAjj < 3; idxAjj++) {
-      b_j = 3 * idxAjj + nz;
-      rtDW.dv[b_j] = (rtDW.P_g[b_j] - ((rtDW.P_g[3 * idxAjj + 1] * ssq +
-        rtDW.P_g[3 * idxAjj] * propagated_points) + rtDW.P_g[3 * idxAjj + 2] *
-        P_minus_1)) / 0.965;
-    }
-  }
-
-  std::memcpy(&rtDW.P_g[0], &rtDW.dv[0], 9U * sizeof(real_T));
-  if (rtDW.theta[0] < -1.0E-6) {
-    // Outport: '<Root>/apogee_out'
-    rtY.apogee_out = rtDW.theta[2] - rtDW.theta[1] * rtDW.theta[1] / (4.0 *
-      rtDW.theta[0]);
-  } else {
-    // Outport: '<Root>/apogee_out'
-    rtY.apogee_out = (rtNaN);
-  }
-
-  for (nz = 0; nz < 2; nz++) {
-    for (idxAjj = 0; idxAjj < 49; idxAjj++) {
-      rtDW.history_buffer.data[idxAjj + 50 * nz] = rtDW.history_buffer.data[(50 *
-        nz + idxAjj) + 1];
-    }
-  }
-
-  rtDW.history_buffer.data[49] = rtU.current_time_in;
-  rtDW.history_buffer.data[99] = diff_idx_0;
-  for (nz = 0; nz < 50; nz++) {
-    rtDW.b_x_data[nz] = std::isnan(rtDW.history_buffer.data[nz]);
-  }
-
-  nz = rtDW.b_x_data[0];
-  for (ix = 0; ix < 49; ix++) {
-    nz += rtDW.b_x_data[ix + 1];
-  }
-
-  if (nz == 0) {
-    diff_idx_0 = rtDW.theta[0];
-    accumulatedData = rtDW.theta[1];
-    x_hat = rtDW.theta[2];
-    for (nz = 0; nz < 50; nz++) {
-      ssq = rtDW.history_buffer.data[nz];
-      propagated_points = rtDW.history_buffer.data[nz + 50] - ((ssq * ssq *
-        diff_idx_0 + ssq * accumulatedData) + x_hat);
-      rtDW.c_x_data[nz] = propagated_points * propagated_points;
-    }
-
-    ssq = rtDW.c_x_data[0];
-    accumulatedData = rtDW.history_buffer.data[50];
-    for (nz = 0; nz < 49; nz++) {
-      ssq += rtDW.c_x_data[nz + 1];
-      accumulatedData += rtDW.history_buffer.data[nz + 51];
-    }
-
-    accumulatedData /= 50.0;
-    for (nz = 0; nz < 50; nz++) {
-      propagated_points = rtDW.history_buffer.data[nz + 50] - accumulatedData;
-      rtDW.c_x_data[nz] = propagated_points * propagated_points;
-    }
-
-    accumulatedData = rtDW.c_x_data[0];
-    for (nz = 0; nz < 49; nz++) {
-      accumulatedData += rtDW.c_x_data[nz + 1];
-    }
-
-    if (accumulatedData > 0.0) {
-      // Outport: '<Root>/r2_out'
-      rtY.r2_out = 1.0 - ssq / accumulatedData;
-    } else {
-      // Outport: '<Root>/r2_out'
-      rtY.r2_out = 1.0;
-    }
-  } else {
-    // Outport: '<Root>/r2_out'
-    rtY.r2_out = (rtNaN);
-  }
-
-  // End of MATLAB Function: '<Root>/Apogee_predictor'
 }
 
-// Model initialize function
-void kf::initialize()
-{
-  {
-    int32_T i;
-    static const int16_T tmp[9]{ 1000, 0, 0, 0, 1000, 0, 0, 0, 1000 };
-
-    // SystemInitialize for MATLAB Function: '<Root>/Apogee_predictor'
-    for (i = 0; i < 9; i++) {
-      rtDW.P_g[i] = tmp[i];
-    }
-
-    rtDW.history_buffer.size[0] = 50;
-    rtDW.history_buffer.size[1] = 2;
-    for (i = 0; i < 100; i++) {
-      rtDW.history_buffer.data[i] = (rtNaN);
-    }
-
-    // End of SystemInitialize for MATLAB Function: '<Root>/Apogee_predictor'
-  }
-}
 
 const char_T* kf::RT_MODEL::getErrorStatus() const
 {

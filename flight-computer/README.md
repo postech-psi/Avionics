@@ -29,7 +29,8 @@ IMU와 GNSS의 출력 설정은 센서에 미리 저장되어 있어야 한다. 
 
 기울기 판정은 기수가 위를 향할 때 `cos(roll) × cos(pitch)`가 약 −1인
 장착 방향을 전제로 한다. 센서나 서보 장착을 바꾸면 각도와 개방 방향을
-다시 확인해야 한다.
+다시 확인해야 한다. D3–D6 꼬리핀 출력은 기본 비활성이다.
+[연말 발사 통합 검토](docs/2026_year_end_launch.md)에서 핀과 좌표계를 확인한다.
 
 ## 1. 빌드
 
@@ -103,8 +104,10 @@ XBee 프레임은 총 92바이트이며, payload는 little-endian이다.
 
 float 필드 순서는 `time`, `lat`, `lon`, `euler[3]`, `accel[3]`, `gyro[3]`,
 `pos[3]`, `altitude`, `pressure`, `kalman[4]`, `gnssAlt`다.
-시간은 미션 시작 후 ms, 기압은 hPa, 고도는 m다. `kalman[4]`에는 추정 고도,
-수직속도, 예측 정점고도, 회귀 적합도 R²가 들어간다.
+시간은 미션 시작 후 ms, 기압은 hPa, 고도는 m다. `kalman[4]`의 순서는
+UKF 고도, UKF 수직속도, GRU 아포지(진단 전용), 예약 `NaN`이다. 패킷 크기와
+기존 M4/지상국 포맷은 그대로다. 기존 CSV의 `apogee`는 이제 GRU 값이며
+`r2` 열은 항상 `NaN`이다.
 
 상태 바이트는 `0xBA` PRELAUNCH, `0xBB` LAUNCH, `0xBC` DEPLOY,
 `0xBD` LANDED다. 지상국은 마지막 상태를 GROUND로 표시한다.
@@ -126,42 +129,23 @@ GNSS 응답 비트도 위치 fix를 보장하지 않는다.
 
 ## 5. SD 기록
 
-M4는 부팅마다 사용하지 않은 번호를 찾아 `flight_NNN.csv`와
-`flight_NNN.txt`를 만든다. CSV에는 수신한 텔레메트리를, TXT에는 센서 초기화,
-캘리브레이션과 상태 전환 메시지를 기록한다. 000부터 999까지 모두 사용하면
-새 기록을 시작하지 않는다.
+M4는 부팅마다 사용하지 않은 `flight_NNN.bin`을 만든다. PSILOG v1 파일에는
+센서 데이터와 이벤트가 함께 들어간다. 부팅 때 헤더와 시작 이벤트를 쓰고
+`sync()` 후 다시 읽어 대조한다. 센서 큐는 별도 스레드에서 약 200ms마다
+배치로 쓴다. SD 초기화나 쓰기 실패는 XBee로 알리고, SD 기록만 중단한다.
 
-CSV의 `time_ms`와 M7 텍스트 로그의 `[ms]`는 같은 미션 시계를 사용한다.
-부팅 로그는 미션 시계가 시작되기 전의 시간을 사용하며,
-`[ZERO] mission clock start`가 경계를 표시한다. M4 자체 메시지는 `[M4 ms]`로
-구분한다.
-
-마지막 `note` 열은 health 비트를 풀어 쓴 값이다. 여러 상태는 `|`로 이어진다.
-
-| Note | 의미 |
-|---|---|
-| `ok` | 모든 health 비트가 설정됨 |
-| `imu_stale`, `baro_stale` | 센서는 응답하지만 데이터가 제어 유효기간을 넘김 |
-| `imu_dead`, `baro_dead`, `gnss_dead` | 센서 응답 시간 초과 |
-| `no_baro_ref` | 유효한 기준기압 없음 |
-| `vz_settle` | 속도 경로는 유지되지만 현재 입력을 사용할 수 없음 |
-| `vz_off` | 속도 전개 경로 차단 |
-
-센서가 끊겨도 마지막 측정값은 남아 있을 수 있다. 지상국의 SD 로그 재생은
-측정값 존재 여부 대신 이 note를 읽어 상태를 표시한다.
-
-SD 쓰기는 별도 스레드에서 수행하고 200ms 간격으로 flush와 fsync를 시도한다.
-쓰기 오류가 연속 세 번 발생하면 기록을 중단하고 XBee로 알린다. 버퍼가 차면
-데이터가 유실될 수 있고, 실패한 쓰기를 재시도하는 과정에서 CSV 행이 중복될
-수 있다. LANDED 전환 때 출력되는 비행 요약의 drop 카운터와 시간을 함께 확인한다.
+지상국 **OPEN LOG**에서 BIN을 재생한다. CSV/TXT가 필요하면
+[지상국 변환 안내](../ground-station/README.md#replay-a-flight)를 참고한다.
+기록 상태의 의미, 전원 차단과 QSPI 검토는
+[연말 발사 통합 검토](docs/2026_year_end_launch.md)에 있다.
 
 ## 6. 동작 원리
 
 ### 6.1 실행 구조
 
 M7 루프는 GNSS·IMU·기압 수집, UKF 갱신, 센서 상태 갱신, 비행 판단,
-텔레메트리 큐 적재 순서로 실행된다. 10ms 마감 시각을 놓치면 지나간 주기를
-건너뛴다. RPC 쓰기와 USB 로그 출력은 별도 송신 스레드가 담당한다.
+텔레메트리 큐 적재, 꼬리핀 출력 처리, GRU 추론 진행 순서로 실행된다.
+10ms 마감 시각을 놓치면 지나간 주기를 건너뛴다. RPC 쓰기와 USB 로그 출력은 별도 송신 스레드가 담당한다.
 
 ### 6.2 데이터 흐름
 
@@ -189,12 +173,94 @@ IMU·기압 500ms, GNSS 1000ms 기준으로 판단한다.
 
 ### 6.5 상태 추정
 
-UKF의 시간 간격은 0.02초로 고정되어 있다. IMU의 중력 제거 가속도(g)를
-m/s²로 바꾸고 중력항을 더해 필터에 넣는다. 출력 수직속도는 위쪽이 양수다.
+UKF는 연속해서 채택한 기압 샘플의 `micros()` 차이를 시간 간격으로 사용한다.
+이 시각은 센서 변환 시각이 아니라 I²C 읽기 완료 시각이므로, 100Hz 폴링 위상과
+버스 지연이 섞인 근사값이다. 상태 전파와 프로세스 잡음 `Q`를 함께 조정하며,
+새 기압 샘플 하나당 측정 보정은 한 번만 한다.
+
+35ms를 초과하고 60ms 이하인 기압 공백은 최근 IMU 가속도 표본이 끊기지
+않았을 때만 연결한다. 최신 가속도를 공백 전체의 대표값으로 사용해 실제
+경과 시간만큼 상태를 전파하고, 복귀한 기압 샘플로 한 번 보정한다.
+첫 샘플, 60ms를 초과한 공백, 또는 35ms를 초과한 공백에 IMU 단절이 겹친
+경우에는 기압고도로 재초기화한다. 이후 500ms 동안 유효한 IMU를 사용해
+추정을 이어가며, 복구가 완료되기 전에는 고도를 내보내되 `kf_vel`은 `NaN`으로
+표시한다. 복구 중 IMU가 끊기거나 오래되면 복구 시간을 다시 센다.
+
+IMU의 중력 제거 가속도(g)는 m/s²로 바꾸고 중력항을 더해 입력한다.
+IMU가 오래됐을 때는 선형 가속도 0을 사용하되, 신선한 IMU로 갱신된 속도만
+유효하게 내보낸다. 수직속도는 위쪽이 양수다.
 
 기압 간격 100개의 평균이 17.5–22.5ms에 들어오면 속도 경로의 주기 조건을
 통과한다. 이후에도 50개 간격마다 평균을 확인한다. 35ms보다 긴 공백이나
 최근 네 정상 간격의 합이 70–90ms 범위를 벗어나면 속도 입력을 500ms 동안 막는다.
+이 주기 검사는 가변 시간 간격과 별개로 기존 속도 경로 보호에 유지한다.
+
+호스트에서 정상 주기, 지터, 40/60ms 기압 공백 연결, IMU 단절, 61/120ms
+공백 후 복구를 확인하려면 `flight-computer/`에서 C++17 컴파일러로 실행한다.
+
+```bash
+c++ -std=c++17 -O2 -Ilib/ukf_ert_rtw tests/ukf_timing.cpp lib/ukf_ert_rtw/ukf.cpp -o ukf_timing
+./ukf_timing
+```
+
+**GRU 학습용 호스트 리플레이**는 M7과 같은 기압고도 수락 규칙·시간 간격
+처리·UKF를 사용한다. 아래 명령은 보드 펌웨어를 빌드하거나 업로드하지 않는다.
+
+```bash
+mkdir -p .pio/tools
+c++ -std=c++17 -O2 -Ilib/ukf_ert_rtw tools/ukf_replay.cpp lib/ukf_ert_rtw/ukf.cpp -o .pio/tools/ukf_replay
+.pio/tools/ukf_replay < observations.csv > estimated.csv
+```
+
+Windows 호스트에서는 실행 파일 이름에 `.exe`를 붙인다. CSV 입력 헤더는
+`flight_id,time_us,accel_z_g,baro_alt`다. `flight_id`는 오름차순이며 각 비행의
+`time_us`는 비행 내 마이크로초 시계에서 엄격히 증가해야 한다. `accel_z_g`는
+중력 제거 전역 Z 가속도(g), `baro_alt`는 발사대 상대고도(m)다. 센서가 갱신되지
+않은 칸은 비워 두고, 두 센서가 같은 시각이면 한 행에 기록한다.
+
+출력은 입력 행마다 `flight_id,time_us,baro_alt,kf_alt,kf_vz,valid`를 기록한다.
+`valid=0`이면 `kf_vz`는 빈 칸이다. 재초기화 후 500ms 복구 구간의 속도는
+GRU 입력에 쓸 수 없다. `valid`는 낙하산 전개 허가나 센서의 실제 보드 지연을
+재현하는 플래그가 아니다.
+
+#### M7 GRU 온라인 검증
+
+증강 학습 시드 42의 32유닛 1층 FP32 GRU와 전용 스케일러를 함께 컴파일한다.
+`src/m7/apogee_gru_weights.h`는 체크포인트와 스케일러의 SHA-256을 포함한다.
+ONNX 런타임이나 보드에 따로 복사할 모델 파일은 없다. UKF는 고도·수직속도만
+추정하며 2차회귀와 R²를 더 이상 계산하지 않는다.
+
+20ms 그리드에서 인과적으로 이전 루프 스냅샷을 선택한다(최대 40ms).
+발사 전에도 창을 모으지만 추론은 `LAUNCH` 상태에서만 200ms 간격으로 시작한다.
+코스팅 판정은 하지 않는다. 유효한 100스텝이 연속으로 있어야 추론하며, 각 창의
+은닉 상태는 0에서 시작한다. 기능 확인 전에는 실제 장착 IMU의 축과 부호를
+대조한다. 학습용 로그 규약대로 전역 Z 가속도(g→m/s²), `−abs(pitch)`(도),
+자이로 Z(deg/s→rad/s)를 사용한다.
+
+추론은 전개 판단과 데이터 송신 큐 입력 이후 루프당 최대 8스텝까지 처리한다.
+이미 루프 실행시간이 6ms에 도달했으면 해당 루프에서는 진행하지 않는다.
+유효성이 깨지거나 창을 제때 처리하지 못하면 추론을 중단하며, 400ms 이상 된
+결과는 송신하지 않는다. GRU는 전개 판단 입력이 아니다.
+
+M4의 SD BIN 이벤트에 `[GRU]`(창 종료 시각, `h` GRU 아포지, `quad` 기존
+2차회귀 아포지, 에너지 배율, 추론 소요시간과 지연)와 `[BMP]`(수락된 I²C
+읽기 완료 시각 5개씩)를 기록한다. `h`와 `quad`는 같은 창의 끝 시점에서
+비교한다. 2차회귀도 새 UKF 고도를 사용한다. CSV의 `apogee`는 GRU 값이다.
+`us`는 타임스탬프 접두사가 아닌 미션 마이크로초다.
+구동부를 분리한 벤치에서 `deadline skips`, 기압 간격, RPC/SD 드롭을 먼저
+확인한다. 실비행 오차 산출에는 정점 이후까지 남은 로그가 필요하다.
+
+`flight-computer/`에서 PSIntelligence의 Python 환경과 C++17 컴파일러로:
+
+```bash
+PS=../../PSIntelligence/psintelligence
+python tools/export_gru.py "$PS/data/experiments/apogee-v2-m7-ukf-burst-aug/w100_seed42" src/m7/apogee_gru_weights.h
+mkdir -p .pio/tools
+c++ -std=c++17 -O2 tools/gru_replay.cpp src/m7/apogee_gru.cpp -o .pio/tools/gru_replay
+python tools/verify_gru.py .pio/tools/gru_replay "$PS"
+c++ -std=c++17 -O2 tests/gru_online.cpp src/m7/apogee_gru.cpp -o .pio/tools/gru_online
+.pio/tools/gru_online
+```
 
 ### 6.6 투표 창
 

@@ -66,8 +66,8 @@ are saved as a telemetry CSV and an event TXT file under `ground-station/logs/`.
 **STOP LOG** ends recording, and **START LOG** opens another session.
 
 Use **PLOT CONTROL** to select graphs and **FOLLOW** to keep the flight path
-in view. **OPEN LOG** replays a ground station CSV or a flight-computer SD CSV
-after disconnecting the serial port. Replay supports pause, speed selection,
+in view. After disconnecting the serial port, **OPEN LOG** replays an aircraft SD
+BIN or a ground station CSV. Older SD CSV recordings still work. Replay supports pause, speed selection,
 and seeking through the flight.
 
 The [ground station guide](ground-station/README.md) explains the displays,

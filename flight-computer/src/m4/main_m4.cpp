@@ -1,25 +1,29 @@
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 //~~~~~~ main_m4.cpp - Portenta H7 M4 core: telemetry gateway + SD logger ~~~//
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
-// RPC receive -> (1) 100Hz CSV to SD  (2) decimated XBEE downlink  (3) text logs.
+// RPC receive -> 100Hz binary SD log (samples and events) + decimated XBee.
 // Serial1(XBEE) and the SD card belong to M4 exclusively.
 //
-// How it works, the priority rule that makes logging lossless, the IPC checksum,
-// SD durability limits, upload order : README 5, 6.1, 6.10
+// Binary log format and recovery limits: README.md.
 //
-// [File map]  [1] XBEE Downsampling   [2] SD Logging (CSV/note)  [3] IPC Receive
+// [File map]  [1] XBEE Downsampling   [2] SD Logging            [3] IPC Receive
 //             [4] SD Writer Thread    [5] Setup                  [6] Main Loop
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 #include <Arduino.h>
 #include <RPC.h>
 #include <string.h>
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <fcntl.h>
 #include "../shared/telemetry_frame.h"
 #include "../shared/ipc_protocol.h"
+#include "sd_log_format_20261122.h"
+#include "sd_status_20261122.h"
 #include "SDMMCBlockDevice.h"
 #include "FATFileSystem.h"
+#include "filesystem/File.h"
 #include "mbed.h"
-#include <cstdio>
-// mbed.h also provides the POSIX retarget declarations (fsync etc.)
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 //~~~~~~~~~~ [1] XBEE Telemetry Downsampling (user set) ~~~~~~~~~//
@@ -32,89 +36,32 @@ static uint8_t  g_frame[FRAME_LEN];
 static bool     g_haveFrame = false;
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
-//~~~~~~~~ [2] SD Logging (full 100Hz frames to the card) ~~~~~~~//
+//~~~~~~~~ [2] SD Logging (100Hz samples and events) ~~~~~~~~~~~~//
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
-static SDMMCBlockDevice        sd_bd;
-static mbed::FATFileSystem     sd_fs("fs");
-static FILE*                   sdFile = nullptr;
-static volatile bool           sdOK   = false;
-struct SDRec { uint8_t b[FRAME_LEN]; };
-static mbed::CircularBuffer<SDRec, 512> sdRing;   // ~44KB = ~5s at 100Hz
+static SDMMCBlockDevice sd_bd;
+static mbed::FATFileSystem sd_fs("fs");
+static mbed::File sdFile;
+static std::atomic<bool> sdOK{false};
+static mbed::CircularBuffer<PackedSensorData, 512> sdRing;
+static std::atomic<uint32_t> sdWritten{0};
+static std::atomic<uint32_t> sdBytes{0}, sdLastSampleSyncMs{0};
+static int sdSessionIdx=-1;
+static const char* sdSetupPhase="mount";
+static uint32_t sdDrops = 0;
 
-static const char CSV_HEADER[] =
-    "time_ms,state,lat,lon,euler_x,euler_y,euler_z,accel_x,accel_y,accel_z,"
-    "gyro_x,gyro_y,gyro_z,pos_x,pos_y,pos_z,altitude,pressure,kf_alt,kf_vel,apogee,r2,"
-    "gnss_alt,note\n";
-
-static const char* stateName(uint8_t s) {
-    switch (s) {
-        case 0xBA: return "prelaunch";
-        case 0xBB: return "launch";
-        case 0xBC: return "deploy";
-        case 0xBD: return "ground";
-        default:   return "unknown";
-    }
-}
-
-//### health byte -> CSV note column (values documented in README 5) ###
-static void healthNote(char* out, size_t cap, uint8_t h) {
-    if (h == TLM_HEALTH_ALL) { snprintf(out, cap, "ok"); return; }
-    const char* tok[8];
-    uint8_t cnt = 0;
-    if      (!(h & TLM_IMU_ALIVE))  tok[cnt++] = "imu_dead";
-    else if (!(h & TLM_IMU_FRESH))  tok[cnt++] = "imu_stale";
-    if      (!(h & TLM_BARO_ALIVE)) tok[cnt++] = "baro_dead";
-    else if (!(h & TLM_BARO_FRESH)) tok[cnt++] = "baro_stale";
-    if      (!(h & TLM_GNSS_ALIVE)) tok[cnt++] = "gnss_dead";
-    if      (!(h & TLM_BARO_REF))   tok[cnt++] = "no_baro_ref";
-    if      (!(h & TLM_VZ_TRUSTED)) tok[cnt++] = "vz_off";
-    else if (!(h & TLM_VZ_USABLE))  tok[cnt++] = "vz_settle";
-    size_t n = 0;
-    for (uint8_t i = 0; i < cnt && n + 1 < cap; ++i) {
-        int w = snprintf(out + n, cap - n, i ? "|%s" : "%s", tok[i]);
-        if (w < 0 || (size_t)w >= cap - n) break;
-        n += (size_t)w;
-    }
-    if (n == 0) snprintf(out, cap, "ok");
-}
-
-static int csvLine(char* out, size_t cap, const PackedSensorData& d) {
-    char note[56];
-    healthNote(note, sizeof(note), d.health);
-    return snprintf(out, cap,
-        "%.0f,%s,%.7f,%.7f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,"
-        "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.3f,%.4f,%.1f,%s\n",
-        (double)d.time, stateName(d.state), (double)d.lat, (double)d.lon,
-        (double)d.euler[0], (double)d.euler[1], (double)d.euler[2],
-        (double)d.accel[0], (double)d.accel[1], (double)d.accel[2],
-        (double)d.gyro[0],  (double)d.gyro[1],  (double)d.gyro[2],
-        (double)d.pos[0],   (double)d.pos[1],   (double)d.pos[2],
-        (double)d.altitude, (double)d.pressure,
-        (double)d.kalman[0], (double)d.kalman[1], (double)d.kalman[2], (double)d.kalman[3],
-        (double)d.gnssAlt, note);
-}
-
-static volatile uint32_t       sdWritten = 0;
-static volatile uint32_t       sdDrops   = 0;
-static volatile uint32_t       fmtDrops  = 0;   // csvLine truncated/failed (huge floats)
-
-//### SD text log (M7 boot-check/state lines mirrored to SD alongside XBEE) ###
-static FILE*                   logFile  = nullptr;
-static volatile bool           logOK    = false;
 struct LogRec { uint8_t len; char line[150]; };
-static mbed::CircularBuffer<LogRec, 48> logRing;   // fits the [BARO] burst
-static volatile uint32_t       logDrops = 0;
-static volatile uint32_t       ipcBadFrames = 0;
-static volatile bool           g_sdFailReport = false;
-static volatile bool           g_landedReport = false;
-static volatile bool           g_ipcBadReport = false;
-static bool                    g_ipcBadSeen   = false;
+static mbed::CircularBuffer<LogRec, 48> logRing;
+static uint32_t logDrops = 0;
+static uint32_t ipcBadFrames = 0;
+static std::atomic<bool> g_sdFailReport{false};
+static bool g_landedReport = false;
+static bool g_ipcBadReport = false;
+static bool g_ipcBadSeen = false;
 
 // M7 text arrives already stamped with the M7 mission clock (same axis as the
-// CSV time_ms column) and is written as-is. M4's OWN lines get an "[M4 <ms>] "
-// prefix so the two clocks can never be confused in one file (README 5).
+// sample timestamps) and is stored as-is. M4's own lines get an "[M4 <ms>] " prefix.
 static void logPush(const uint8_t* text, uint16_t len, bool m4Origin = false) {
-    if (!logOK) return;
+    if (!sdOK.load()) return;
     LogRec lr;
     int n = 0;
     if (m4Origin) {
@@ -139,17 +86,20 @@ static void onData(const uint8_t* payload, uint16_t len) {
     if (payload[0] == 0xBD && lastState != 0xBD) g_landedReport = true;
     lastState = payload[0];
 
-    SDRec r;
-    r.b[0] = FRAME_START;
-    memcpy(&r.b[1], payload, sizeof(PackedSensorData));
-    r.b[FRAME_LEN - 1] = FRAME_END;
-
-    if (sdOK) {
-        if (sdRing.full()) sdDrops++; else sdRing.push(r);
+    if (sdOK.load()) {
+        if (sdRing.full()) {
+            sdDrops++;
+        } else {
+            PackedSensorData sample;
+            memcpy(&sample, payload, sizeof(sample));
+            sdRing.push(sample);
+        }
     }
     if (++g_telemCount >= TELEM_DECIMATE) {
         g_telemCount = 0;
-        memcpy(g_frame, r.b, FRAME_LEN);
+        g_frame[0] = FRAME_START;
+        memcpy(g_frame + 1, payload, len);
+        g_frame[FRAME_LEN - 1] = FRAME_END;
         g_haveFrame = true;
     }
 }
@@ -177,103 +127,160 @@ static void dispatch(uint8_t type, const uint8_t* payload, uint16_t len) {
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
-//~ [4] SD Writer Thread: BelowNormal (never blocks RPC/XBEE) ~~~//
+//~ [4] SD Writer Thread: BelowNormal ~~~~~~~~~~~~~~~~~~~~~~~~~~//
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
-// ! BelowNormal is what makes 100Hz logging lossless - do not raise it
+// Keep SD I/O and checksums off the RPC/XBee thread.
 static rtos::Thread sdWriter(osPriorityBelowNormal, 8192, nullptr, "sdwriter");
-static void sdWriterFn() {
-    static char batch[8192];
-    const size_t MAX_LINE = 320;
-    size_t   bl = 0;
-    size_t   pend = 0;
-    uint32_t lastFlush = 0;
-    uint8_t  failCnt = 0;
-    while (true) {
-        if (!sdOK && !logOK) { delay(100); continue; }
 
-        SDRec r;
-        // pop only when a full line still fits -> a full batch never loses a popped record
-        while (bl + MAX_LINE <= sizeof(batch) && sdRing.pop(r)) {
-            PackedSensorData d;
-            memcpy(&d, r.b + 1, sizeof(d));
-            int n = csvLine(batch + bl, sizeof(batch) - bl, d);
-            if (n > 0 && (size_t)n < sizeof(batch) - bl) { bl += (size_t)n; pend++; }
-            else fmtDrops++;   // popped record whose line did not fit - counted, never silent
+static bool writeAndSync(const uint8_t* bytes, size_t size) {
+    return sdstatus::writeAndSync(sdFile,bytes,size,[](){ delay(10); });
+}
+
+// Called only from loop/setup, so status text cannot interleave XBee frames.
+static void reportSdStatus(bool force=false) {
+    static uint32_t lastReport=0;
+    static sdstatus::State previous=sdstatus::State::Checking;
+    const uint32_t now=millis();
+    const uint32_t samples=sdWritten.load(std::memory_order_acquire);
+    const uint32_t lastSync=sdLastSampleSyncMs.load(std::memory_order_relaxed);
+    const auto state=sdstatus::evaluate(sdOK.load(),samples,now,lastSync,sdDrops,logDrops);
+    if (!force && state==previous && uint32_t(now-lastReport)<1000) return;
+    previous=state; lastReport=now;
+    char message[144];
+    snprintf(message,sizeof(message),
+        "[SD] %s n=%lu bytes=%lu age=%lu drop=%lu/%lu file=%d",
+        sdstatus::name(state),(unsigned long)samples,
+        (unsigned long)sdBytes.load(std::memory_order_relaxed),
+        (unsigned long)(samples ? uint32_t(now-lastSync) : 0),
+        (unsigned long)sdDrops,(unsigned long)logDrops,sdSessionIdx);
+    xbeeLog(message);
+    logPush((const uint8_t*)message,strlen(message),true);
+}
+
+static void sdWriterFn() {
+    static uint8_t batch[8192];
+    uint32_t lastWrite = millis();
+    while (sdOK.load()) {
+        const uint32_t now = millis();
+        if (now - lastWrite < 200 || (sdRing.empty() && logRing.empty())) {
+            delay(1);
+            continue;
         }
-        uint32_t ms = millis();
-        if ((uint32_t)(ms - lastFlush) >= 200 && (bl > 0 || !logRing.empty())) {
-            lastFlush = ms;
-            bool ok = true;
-            if (sdOK && bl > 0) {
-                if (fwrite(batch, 1, bl, sdFile) == bl &&
-                    fflush(sdFile) == 0 && fsync(fileno(sdFile)) == 0) {
-                    sdWritten += pend;
-                    bl = 0; pend = 0;
-                } else ok = false;
+        lastWrite = now;
+
+        size_t used = 0;
+        uint32_t samples = 0;
+        PackedSensorData sample;
+        LogRec event;
+        for (;;) {
+            const size_t previous = used;
+            if (sizeof(batch) - used >= sizeof(sample) + sdlog::recordOverhead
+                && sdRing.pop(sample)) {
+                used += sdlog::encode(batch + used, sdlog::dataRecord, &sample, sizeof(sample));
+                samples++;
             }
-            if (logOK && !logRing.empty()) {
-                LogRec lr;
-                bool wrote = false;
-                while (logRing.pop(lr)) {
-                    if (fwrite(lr.line, 1, lr.len, logFile) != lr.len) { ok = false; break; }
-                    wrote = true;
-                }
-                if (wrote && (fflush(logFile) != 0 || fsync(fileno(logFile)) != 0)) ok = false;
+            if (sizeof(batch) - used >= sizeof(event.line) + sdlog::recordOverhead
+                && logRing.pop(event)) {
+                used += sdlog::encode(batch + used, sdlog::eventRecord, event.line, event.len);
             }
-            if (ok) failCnt = 0;
-            else if (++failCnt >= 3) {
-                //### Card removed/bad: stop SD to protect what is already written ###
-                sdOK = false; logOK = false;
-                if (sdFile)  { fclose(sdFile);  sdFile  = nullptr; }
-                if (logFile) { fclose(logFile); logFile = nullptr; }
-                g_sdFailReport = true;   // ! flag only - see xbeeLog note
-            }
+            if (used == previous) break;
         }
-        delay(1);
+        if (used > 0 && !writeAndSync(batch, used)) {
+            sdOK.store(false);
+            g_sdFailReport.store(true);  // XBee notices are sent from loop().
+            sdFile.close();
+            return;
+        }
+        sdBytes.fetch_add((uint32_t)used,std::memory_order_relaxed);
+        if (samples) {
+            sdLastSampleSyncMs.store(millis(),std::memory_order_relaxed);
+            sdWritten.fetch_add(samples,std::memory_order_release);
+        }
     }
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 //~~~~~~~~~~~~~~~~~~~~~~~~~ [5] Setup ~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
+static int openSession() {
+    sdSetupPhase="mount";
+    if (sd_fs.mount(&sd_bd) != 0) return -1;
+
+    // Reserve old CSV/TXT session numbers too, so the matching PC outputs
+    // never collide with names already assigned on this card.
+    constexpr const char* extensions[] = {"csv", "txt", "bin"};
+    char path[24];
+    for (int i = 0; i < 1000; ++i) {
+        bool used = false;
+        for (const char* ext : extensions) {
+            snprintf(path, sizeof(path), "flight_%03d.%s", i, ext);
+            struct stat info;
+            const int result = sd_fs.stat(path, &info);
+            if (result == 0) {
+                used = true;
+                break;
+            }
+            if (result != -ENOENT) return -1;
+        }
+        if (used) continue;
+
+        snprintf(path, sizeof(path), "flight_%03d.bin", i);
+        // FatFs can open an existing file with O_CREAT. Use append mode and
+        // check the file after opening so the header never overwrites data.
+        sdSetupPhase="open";
+        if (sdFile.open(&sd_fs, path, O_RDWR | O_CREAT | O_APPEND) != 0) return -1;
+        const off_t size = sdFile.size();
+        if (size != 0) {
+            sdFile.close();
+            if (size < 0) return -1;
+            continue;
+        }
+        // A valid BIN event is the probe; no temporary file or format operation.
+        uint8_t probe[96];
+        memcpy(probe,sdlog::fileHeader,sizeof(sdlog::fileHeader));
+        static const char text[]="[SD] boot write/read probe\n";
+        const size_t probeSize=sizeof(sdlog::fileHeader) + sdlog::encode(
+            probe+sizeof(sdlog::fileHeader),sdlog::eventRecord,text,sizeof(text)-1);
+        sdSetupPhase="probe_write";
+        if (!writeAndSync(probe,probeSize)) { sdFile.close(); return -1; }
+        sdSetupPhase="probe_readback";
+        if (!sdstatus::verifyProbe(sdFile,probe,probeSize)) { sdFile.close(); return -1; }
+        sdBytes.store((uint32_t)probeSize);
+        sdSetupPhase="none";
+        return i;
+    }
+    return -1;
+}
+
 void setup() {
     Serial1.begin(115200);
     // 0xAA prefix is mandatory - the ground station discards unprefixed text
     if (!RPC.begin()) xbeeLog("[ERROR] M4 RPC.begin() failed");
 
-    //### SD mount + session rotation (existing files are never overwritten) ###
-    int sessionIdx = -1;
-    if (sd_fs.mount(&sd_bd) == 0) {
-        char csvPath[28], txtPath[28];
-        for (int i = 0; i < 1000; ++i) {
-            snprintf(csvPath, sizeof(csvPath), "/fs/flight_%03d.csv", i);
-            snprintf(txtPath, sizeof(txtPath), "/fs/flight_%03d.txt", i);
-            char binPath[28];
-            snprintf(binPath, sizeof(binPath), "/fs/flight_%03d.bin", i);
-            FILE* p;
-            if ((p = fopen(csvPath, "rb"))) { fclose(p); continue; }
-            if ((p = fopen(binPath, "rb"))) { fclose(p); continue; }
-            if ((p = fopen(txtPath, "rb"))) { fclose(p); continue; }
-            sessionIdx = i;
-            break;
-        }
-        if (sessionIdx >= 0) {
-            sdFile  = fopen(csvPath, "wb");
-            logFile = fopen(txtPath, "wb");
-            sdOK  = (sdFile  != nullptr);
-            logOK = (logFile != nullptr);
-            if (sdOK) fputs(CSV_HEADER, sdFile);
-            if (sdOK || logOK) sdWriter.start(mbed::callback(sdWriterFn));
+    xbeeLog("[SD] CHECKING n=0 bytes=0 age=0 drop=0/0 file=-1");
+    int sessionIdx = openSession();
+    if (sessionIdx >= 0) {
+        sdOK.store(true);
+        if (sdWriter.start(mbed::callback(sdWriterFn)) != osOK) {
+            sdOK.store(false);
+            sdFile.close();
+            sessionIdx = -1;
+            sdSetupPhase="writer_thread";
         }
     }
-    char sdMsg[72];
+    sdSessionIdx=sessionIdx;
+    char sdMsg[112];
     if (sessionIdx >= 0)
-        snprintf(sdMsg, sizeof(sdMsg), "[SYS] SD data=%s log=%s file=flight_%03d (100Hz)",
-                 sdOK ? "ON" : "OFF", logOK ? "ON" : "OFF", sessionIdx);
+        snprintf(sdMsg, sizeof(sdMsg), "[SYS] SD BIN file=flight_%03d.bin (100Hz)", sessionIdx);
     else
-        snprintf(sdMsg, sizeof(sdMsg), "[ERROR] SD disabled (mount fail or 1000 sessions full)");
+        snprintf(sdMsg, sizeof(sdMsg), "[ERROR] SD disabled (phase=%s)",sdSetupPhase);
     xbeeLog(sdMsg);
+    if (sessionIdx>=0) xbeeLog("[INIT] SD write/sync/readback OK; waiting for sensor samples");
     logPush((const uint8_t*)sdMsg, strlen(sdMsg), true);
+    static const char renewal[] = "[INIT] M4 2026 YEAR END: PSILOG v1 BIN";
+    xbeeLog(renewal);
+    logPush((const uint8_t*)renewal, sizeof(renewal) - 1, true);
+    reportSdStatus(true);
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -321,8 +328,7 @@ void loop() {
     }
 
     //### One-shot reports (flags set elsewhere, all sent from this context) ###
-    if (g_sdFailReport) {
-        g_sdFailReport = false;
+    if (g_sdFailReport.exchange(false)) {
         xbeeLog("[ERROR] SD write failed - logging stopped");   // SD is dead: XBEE only
     }
     if (g_ipcBadReport) {
@@ -335,13 +341,13 @@ void loop() {
         g_landedReport = false;
         char m[128];
         snprintf(m, sizeof(m),
-                 "[SYS] flight summary: written=%lu sd_drops=%lu log_drops=%lu ipc_bad=%lu fmt_drops=%lu",
-                 (unsigned long)sdWritten, (unsigned long)sdDrops,
-                 (unsigned long)logDrops, (unsigned long)ipcBadFrames,
-                 (unsigned long)fmtDrops);
+                 "[SYS] flight summary: written=%lu sd_drops=%lu log_drops=%lu ipc_bad=%lu",
+                 (unsigned long)sdWritten.load(std::memory_order_relaxed),
+                 (unsigned long)sdDrops, (unsigned long)logDrops, (unsigned long)ipcBadFrames);
         xbeeLog(m);
         logPush((const uint8_t*)m, strlen(m), true);
     }
 
+    reportSdStatus();
     delay(1);   // yield to sdWriter; 1ms polling is ample for 100Hz
 }

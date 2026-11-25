@@ -28,16 +28,20 @@
 #include "rtos.h"
 #include <chrono>
 #include <RPC.h>
-#include "ukf.h"
-#include "rtwtypes.h"
 #include "../parsers.h"
 #include "../shared/telemetry_frame.h"
 #include "../shared/ipc_protocol.h"
+#include "../shared/vertical_observation.h"
+#include "apogee_gru.h"
+#include "quadratic_apogee.h"
+#include "tailfin_outputs.h"
 
 using namespace mbed;
 using namespace rtos;
 using namespace std::chrono;
-kf Kalmanfilter;
+static vertical::StateEstimator verticalEstimator;
+static apogee_gru::Online onlineApogee;
+static QuadraticApogee quadraticApogee;
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 //~~~~~~~~~~~~~~~~ [1] Data Structure (M7 local) ~~~~~~~~~~~~~~~~//
@@ -53,7 +57,7 @@ struct SensorData {
     float pos[3]   = {0, 0, 0};  // integrated distance, global, m (drifts - log only)
     float altitude = 0.0;        // above pad reference, m
     float pressure = 0.0;        // hPa
-    float kalman[4] = {0, 0, 0, 0};  // kf_alt, kf_vel, apogee, r2
+    float kalman[4] = {0, 0, NAN, NAN};  // UKF altitude/vz, GRU apogee, reserved
     float gnssAlt = 0.0f;            // GNSS hMSL, m - log/recovery only,
                                      // NEVER used by any flight decision
     uint8_t health = 0;              // TLM_* flags for THIS frame
@@ -64,6 +68,7 @@ struct SensorData {
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 Adafruit_BMP3XX Barometer;                    // BMP390, I2C Wire2, 0x76
 Servo           Parachute;                    // deploy servo on D2
+static tailfin::Outputs tailfinOutputs;
 UART            GNSS(PG_14, PG_9, NC, NC);    // NEO-M9N, UBX-POSLLH, 38400
 UART            IMU(PJ_8, PJ_9, NC, NC);      // EBIMU-9DOFV6, 230400
 
@@ -110,11 +115,6 @@ const float    STATIC_GYRO_DPS      = 5.0f;
 const float    STATIC_ACCEL_G       = 0.2f;
 const float    STATIC_ALT_BAND_M    = 2.0f;
 
-//### Barometer plausibility ###
-const float    BARO_MAX_RATE_MPS = 680.0f;    // ~Mach 2 = 13.6m per 20ms sample
-const uint32_t BARO_RATE_GAP_MS  = 200;
-const uint32_t BARO_STEP_MAX_MS  = 35;        // 10ms polling x 50Hz -> 10/20/30 normal
-
 //### Sensor health timeouts (death/recovery reporting, cal skip) ###
 const uint32_t IMU_TIMEOUT_MS    = 500;
 const uint32_t BARO_TIMEOUT_MS   = 500;
@@ -130,8 +130,6 @@ const uint32_t BARO_BOOT_RETRY_INTERVAL_MS = 1000;
 //                 module config 2026-08-04). Log/recovery only, gates nothing.
 
 //### Control freshness - SEPARATE from health, gates votes and the UKF ###
-const uint32_t IMU_CTRL_FRESH_MS  = 30;
-const uint32_t BARO_CTRL_FRESH_MS = 60;
 const uint32_t VZ_BARO_GAP_MS     = 200;
 const uint32_t VZ_SETTLE_MS       = 500;
 // After the deploy lockout, sustained unusability must release the tilt backup.
@@ -140,17 +138,11 @@ const uint32_t VZ_UNUSABLE_TIMEOUT_MS = 1000;
 const float    VZ_PLAUSIBLE_MAX   = 200.0f; // |vz| beyond this = filter divergence
 const uint16_t CADENCE_ARM_N       = 100;   // clean intervals to arm the vz path
 const uint16_t CADENCE_BLOCK_N     = 50;    // rolling re-check block size
-const float    CADENCE_MEAN_LO_MS  = 17.5f; // accepted mean band (= rolling-4
-const float    CADENCE_MEAN_HI_MS  = 22.5f; //   sum 70..90). Bench: real BMP390
-                                            //   ODR measured 19.42ms (+3% fast,
-                                            //   oscillator tolerance) - a tight
-                                            //   19.5..20.5 band killed vz on a
-                                            //   HEALTHY sensor. +-12.5% scale
-                                            //   error on vz is harmless; the
-                                            //   guard targets 25%+ (25/30ms).
+const float    CADENCE_MEAN_LO_MS  = 17.5f; // expected hardware cadence, not a UKF dt
+const float    CADENCE_MEAN_HI_MS  = 22.5f; // allows BMP390 oscillator tolerance
 const uint32_t CADENCE_DEADLINE_MS = 10000; // arming give-up (mission ms)
-const uint32_t CADENCE_FAST_SUM_LO = 70;    // last-4 clean intervals: sum 70~90
-const uint32_t CADENCE_FAST_SUM_HI = 90;    //  = mean 17.5~22.5ms, checked per sample
+const uint32_t CADENCE_FAST_SUM_LO_US = 70000; // last-4 clean intervals
+const uint32_t CADENCE_FAST_SUM_HI_US = 90000; // mean 17.5~22.5ms
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 //~~~~~~~~~~~~~~~~ [5] State Variables & Freshness ~~~~~~~~~~~~~~//
@@ -161,13 +153,13 @@ float    basePressure  = 1013.0f;
 float    altLaunchAvg  = 0.0f;   // mean of the 2 latest REAL baro samples
 bool     baroRefValid  = false;  // ground reference passed the quality gate
 bool     vzTrusted     = true;   // kalman-vz deploy path enable (one-way latch)
-bool     vzCadenceOK   = false;  // measured baro interval matches the UKF's 20ms
+bool     vzCadenceOK   = false;  // barometer cadence passed the control checks
 uint32_t vzBlockUntil  = 0;      // short-gap blanking deadline
 bool     altVotePendingReset = false;  // pre-launch baro gap -> wipe altitude votes
 bool     vzVotePendingReset  = false;  // bad cadence -> wipe vz votes (runDecision)
 
-uint32_t baroIvalSum   = 0;      // accepted-sample interval accounting,
-uint32_t baroIvalCnt   = 0;      // reported once at PRELAUNCH
+uint32_t baroIvalSumUs = 0;      // accepted-sample interval accounting
+uint32_t baroIvalCnt   = 0;
 
 bool     imuAlive      = false;
 bool     baroAlive     = false;
@@ -179,10 +171,10 @@ bool     rpcOK         = false;
 
 //### Single source of truth for "fresh enough to act on" ###
 static inline bool imuFreshNow(uint32_t now) {
-    return imuLastMs && (now - imuLastMs) <= IMU_CTRL_FRESH_MS;
+    return imuLastMs && (now - imuLastMs) <= vertical::kImuFreshMs;
 }
 static inline bool baroFreshNow(uint32_t now) {
-    return baroLastMs && (now - baroLastMs) <= BARO_CTRL_FRESH_MS;
+    return baroLastMs && (now - baroLastMs) <= vertical::kBaroFreshMs;
 }
 
 // Every precondition of the vz deploy vote, in one place, so the flight logic
@@ -365,6 +357,7 @@ void parseIMU(SensorData &d) {
             if (parsers::parseImuLine(imuBuf, vals)) {
                 if (imuSampleSane(vals)) {
                     imuLastMs = millis();
+                    verticalEstimator.observeImu(imuLastMs, vals[8]);
                     d.euler[0] = vals[0];  d.euler[1] = vals[1];  d.euler[2] = vals[2];
                     d.gyro[0]  = vals[3];  d.gyro[1]  = vals[4];  d.gyro[2]  = vals[5];
                     d.accel[0] = vals[6];  d.accel[1] = vals[7];  d.accel[2] = vals[8];
@@ -378,34 +371,24 @@ void parseIMU(SensorData &d) {
     }
 }
 
-// Returns true on a FRESH sample - the caller uses that to step the UKF at 50Hz.
-bool parseBaro(SensorData &d) {
+static bool parseBaro(SensorData& d, vertical::BaroTiming& timing) {
     if (Barometer.readNonBlocking()) {
+        // No DRDY timestamp on this path; read completion approximates
+        // acquisition time and includes polling and I2C jitter.
+        const uint32_t nowUs = micros();
+        const uint32_t nowMs = millis();
         float p = (float)Barometer.pressure / 100.0f;
         if (!std::isfinite(p) || p < 300.0f || p > 1250.0f) return false;
         float altNow = parsers::pressureToAltitude(p, basePressure);
-        if (!std::isfinite(altNow)) return false;
-        uint32_t nowMs = millis();
-
-        //### Rate check against the last ACCEPTED sample (README 6.3) ###
-        static float    prevValidAlt = 0.0f;
-        static uint32_t prevValidMs  = 0;
-        if (prevValidMs) {
-            uint32_t dt = nowMs - prevValidMs;
-            if (dt <= BARO_RATE_GAP_MS &&
-                fabsf(altNow - prevValidAlt) > BARO_MAX_RATE_MPS * (float)dt * 0.001f)
-                return false;
-
-            //### Gap judged HERE, from the interval - not later from an age ###
-            // ! runDecision can only ask "how old is the last sample", and by
-            //   the time it runs baroLastMs has already been refreshed below,
-            //   so a gap that ENDS is invisible to it. This sample is fresh but
-            //   the stream before it was not, and parseKalman is about to fold
-            //   the whole gap into one 20ms step -> real velocity transient.
-            //   Covers the cases runDecision structurally cannot: the M7 loop
-            //   itself stalling, and gaps during PRELAUNCH (README 6.7).
-            if (dt > BARO_STEP_MAX_MS) {
+        static vertical::BaroHistory history;
+        if (!history.accept(nowUs, altNow, timing)) return false;
+        const uint32_t dt = timing.intervalUs;
+        if (dt != 0) {
+            // Check the completed interval before refreshing baroLastMs.
+            // The deployment blanking policy is independent of UKF recovery.
+            if (dt > vertical::kCadenceMaxIntervalUs) {
                 vzBlockUntil = nowMs + VZ_SETTLE_MS;      // any state
+                vzVotePendingReset = true;
                 if (flightState == FlightState::STARTUP ||
                     flightState == FlightState::PRELAUNCH)
                     altVotePendingReset = true;
@@ -413,69 +396,83 @@ bool parseBaro(SensorData &d) {
                 //   reacquisition transients must re-earn all 50 votes and
                 //   never ride on pre-gap votes (consumed in runDecision)
                 if (vzTrusted && flightState == FlightState::LAUNCH &&
-                    dt > VZ_BARO_GAP_MS) {
+                    dt > VZ_BARO_GAP_MS * 1000u) {
                     vzTrusted = false;
                     char m[72];
                     snprintf(m, sizeof(m), "[WARN] vz deploy path disabled (baro gap %lums)",
-                             (unsigned long)dt);
+                             (unsigned long)(dt / 1000u));
                     logEvent(m);   // ! queued - no RPC before this loop's decision
                 }
             } else {
-                baroIvalSum += dt; baroIvalCnt++;   // clean intervals only
-                //### Fast cadence guard: rolling mean of the last 4 intervals ###
-                // ! replaces the consecutive-slow counter, which a 20/30ms
-                //   ALTERNATING degradation bypassed forever (every 20 reset
-                //   it) while still scaling UKF velocity by 1.25x. A 4-sample
-                //   sum outside 70..90 (mean 17.5~22.5ms) blanks vz on the
-                //   spot and voids its votes - one baro sample feeds ~3 loop
-                //   votes, so any guard slower than ~4 samples loses the race
-                //   against the 10/12 window. Legit phase jitter pairs each 30
-                //   with a 10, keeping the sum at ~80; a false trip only costs
-                //   a self-recovering 500ms blank.
-                static uint32_t dtRing[4] = {20, 20, 20, 20};
+                baroIvalSumUs += dt; baroIvalCnt++;   // clean intervals only
+                // Four intervals span ~80ms even with polling-phase jitter.
+                // Keep the fast guard while dt still uses read timestamps.
+                static uint32_t dtRing[4];
                 static uint8_t  dtIdx = 0, dtCnt = 0;
                 dtRing[dtIdx] = dt;
                 dtIdx = (uint8_t)((dtIdx + 1) & 3);
                 if (dtCnt < 4) dtCnt++;
                 if (dtCnt == 4) {
                     uint32_t sum = dtRing[0] + dtRing[1] + dtRing[2] + dtRing[3];
-                    if (sum < CADENCE_FAST_SUM_LO || sum > CADENCE_FAST_SUM_HI) {
+                    if (sum < CADENCE_FAST_SUM_LO_US || sum > CADENCE_FAST_SUM_HI_US) {
                         vzBlockUntil = nowMs + VZ_SETTLE_MS;
                         vzVotePendingReset = true;
                     }
                 }
             }
         }
-        prevValidAlt = altNow;
-        prevValidMs  = nowMs;
+        altLaunchAvg = timing.pairMeanAltitude;
 
         baroLastMs = nowMs;
         d.pressure = p;
         d.altitude = altNow;
 
-        // ! averaged HERE (at the sample source), not in the loop - phase-free
-        static float prevAlt  = 0.0f;
-        static bool  havePrev = false;
-        altLaunchAvg = havePrev ? (prevAlt + d.altitude) * 0.5f : d.altitude;
-        prevAlt  = d.altitude;
-        havePrev = true;
         return true;
     }
     return false;
 }
 
-// ! CALL ONLY ON A FRESH BARO SAMPLE (=50Hz). The generated UKF hardcodes
-//   dt=0.02s and the baro produces 50 new values/s (README 6.5).
-void parseKalman(SensorData &d) {
-    float aLin = imuFreshNow(millis()) ? d.accel[2] : 0.0f;   // ! stale -> 0, never frozen
-    Kalmanfilter.rtU.accel_z_in       = aLin * 9.81f + 9.81f; // ! +g = specific force
-    Kalmanfilter.rtU.baro_altitude_in = d.altitude;
-    Kalmanfilter.rtU.current_time_in  = (micros() - Setup_Time_us) / 1000000.0;
-    Kalmanfilter.step();
-    d.kalman[0] = Kalmanfilter.rtY.kf_altitude_out;
-    d.kalman[1] = Kalmanfilter.rtY.kf_velocity_out;
-    d.kalman[2] = Kalmanfilter.rtY.apogee_out;
-    d.kalman[3] = Kalmanfilter.rtY.r2_out;
+// Only called for accepted barometer observations, nominally at 50 Hz.
+static void parseKalman(SensorData& d, const vertical::BaroTiming& baro) {
+    verticalEstimator.observeBaro(baro, baroLastMs, d.altitude);
+    d.kalman[0] = verticalEstimator.altitude();
+}
+
+// Batch BMP acquisition proxies (I2C read-completion timestamps) for SD.
+// Values are mission microseconds; they are not the log prefix's send time.
+static void logBaroRead(uint32_t readUs) {
+    static uint32_t times[5];
+    static unsigned count = 0;
+    times[count++] = readUs - Setup_Time_us;
+    if (count != 5) return;
+    count = 0;
+    char line[72];
+    snprintf(line, sizeof(line), "[BMP] us=%lu,%lu,%lu,%lu,%lu",
+             (unsigned long)times[0], (unsigned long)times[1], (unsigned long)times[2],
+             (unsigned long)times[3], (unsigned long)times[4]);
+    logMsg(line, ipc::TYPE_LOG_SD);
+}
+
+static void advanceApogee() {
+    if (!onlineApogee.busy()) return;
+    static uint32_t gridUs = 0, workUs = 0;
+    if (gridUs != onlineApogee.pendingGridUs()) {
+        gridUs = onlineApogee.pendingGridUs();
+        workUs = 0;
+    }
+    const uint32_t t0 = micros();
+    const bool complete = onlineApogee.advance();
+    workUs += micros() - t0;
+    if (!complete) return;
+
+    // The endpoint, not this completion time, is the timestamp for validation.
+    const auto& prediction = onlineApogee.latest();
+    char line[144];
+    snprintf(line, sizeof(line), "[GRU] us=%lu h=%.4f r=%.6f cpu_us=%lu age_us=%lu quad=%.4f",
+             (unsigned long)(gridUs - Setup_Time_us), (double)prediction.altitude,
+             (double)prediction.ratio, (unsigned long)workUs, (unsigned long)(micros() - gridUs),
+             (double)prediction.quadraticAltitude);
+    logMsg(line, ipc::TYPE_LOG_SD);
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -986,7 +983,6 @@ void setup() {
 
     sensor_check();
 
-    Kalmanfilter.initialize();
     flightState = FlightState::STARTUP;
 
     //### Boot checks & zeroing - skipped for dead sensors ###
@@ -1015,12 +1011,14 @@ void setup() {
 
     Setup_Time    = millis();
     Setup_Time_us = micros();
+    onlineApogee.start(Setup_Time_us);
     // log prefixes switch from boot ms to mission ms exactly here
     char mc[64];
     snprintf(mc, sizeof(mc), "[ZERO] mission clock start (boot +%lums)",
              (unsigned long)Setup_Time);
     logMsg(mc);
     logMsg("[STATE] PRELAUNCH");
+    tailfinOutputs.begin();
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -1032,7 +1030,11 @@ void loop() {
     parseIMU(d);
     d.time = millis() - Setup_Time;
 
-    if (parseBaro(d)) parseKalman(d);   // ! UKF at 50Hz, everything else 100Hz
+    vertical::BaroTiming baro{};
+    const bool newBaro = parseBaro(d, baro);
+    if (newBaro) parseKalman(d, baro);
+    d.kalman[1] = verticalEstimator.velocity(millis());
+    const uint32_t sampleUs = micros();
 
     updateSensorHealth();
     runDecision(d);
@@ -1044,31 +1046,50 @@ void loop() {
         default:                  d.state = 0xBA; break;
     }
 
+    if (newBaro && std::isfinite(d.kalman[0])) {
+        quadraticApogee.observe((baro.readUs - Setup_Time_us) * 1e-6,d.kalman[0]);
+    }
+    onlineApogee.observe(sampleUs, {d.altitude, d.kalman[0], d.kalman[1],
+                                  d.accel[2], d.euler[1], d.gyro[2], quadraticApogee.altitude()},
+                         baroRefValid && std::isfinite(d.kalman[1]),
+                         flightState == FlightState::LAUNCH);
+    d.kalman[2] = onlineApogee.altitude(sampleUs);
     d.health = sensorFlags();
     ipcSendData(d);
+    const uint32_t outputNow = millis();
+    tailfinOutputs.update(d.euler,d.gyro,d.kalman[0],d.kalman[1],
+        flightState == FlightState::LAUNCH && baroRefValid && vzUsableNow(outputNow,d.kalman[1]));
+    static const char* lastTailfinStatus = nullptr;
+    static uint32_t lastTailfinReport = 0;
+    const char* tailfinStatus = tailfinOutputs.status();
+    if (tailfinStatus != lastTailfinStatus || outputNow - lastTailfinReport >= 1000) {
+        lastTailfinStatus = tailfinStatus;
+        lastTailfinReport = outputNow;
+        char message[40];
+        snprintf(message,sizeof(message),"[TAILFIN] OUTPUT %s",tailfinStatus);
+        logMsg(message);
+    }
     flushEvents();
     // ! the ONLY exit for deferred warnings - always after runDecision, and
     //   after the data frame so M4's record order stays data-then-text
+    if (newBaro) logBaroRead(baro.readUs);
+    // Optional work after the decision and telemetry enqueue; at most eight
+    // recurrent steps. A delayed job is discarded rather than caught up.
+    if (micros() - loopT0 < 6000u) advanceApogee();
 
     //### Baro cadence: arm once, then keep watching (post-decision zone) ###
-    // ! the UKF hardcodes dt=0.02s, so a systematically different sensor rate
-    //   scales every velocity estimate. vzCadenceOK starts false: vz stays
-    //   disarmed until the first CADENCE_ARM_N clean intervals prove the rate,
-    //   then every CADENCE_BLOCK_N intervals re-check it (a mid-flight slowdown
-    //   raises the mean; phase jitter 10/30ms does not move it). Any failure is
-    //   permanent for the flight - vzTrusted drops too, so the CSV note reads
-    //   vz_off, not the transient vz_settle. Outliers are excluded upstream
-    //   (single dropped samples are the per-sample gap check's job).
+    // Keep the existing 50 Hz stream-quality checks independent of UKF dt.
+    // Outliers are handled by the per-sample gap check and excluded here.
     static bool cadenceArmDone = false;
     if (!cadenceArmDone) {
         if (baroIvalCnt >= CADENCE_ARM_N) {
             cadenceArmDone = true;
-            float mean = (float)baroIvalSum / (float)baroIvalCnt;
-            baroIvalSum = 0; baroIvalCnt = 0;
+            float mean = 0.001f * (float)baroIvalSumUs / (float)baroIvalCnt;
+            baroIvalSumUs = 0; baroIvalCnt = 0;
             vzCadenceOK = (mean >= CADENCE_MEAN_LO_MS && mean <= CADENCE_MEAN_HI_MS);
             if (!vzCadenceOK) vzTrusted = false;
             char m[96];
-            snprintf(m, sizeof(m), "[%s] Baro cadence: n=%u mean=%.2fms (UKF assumes 20.00) %s",
+            snprintf(m, sizeof(m), "[%s] Baro cadence: n=%u mean=%.2fms %s",
                      vzCadenceOK ? "ZERO" : "WARN", (unsigned)CADENCE_ARM_N, (double)mean,
                      vzCadenceOK ? "OK" : "-> vz deploy path disabled");
             logMsg(m);
@@ -1086,14 +1107,14 @@ void loop() {
             }
         }
     } else if (baroIvalCnt >= CADENCE_BLOCK_N) {
-        float mean = (float)baroIvalSum / (float)baroIvalCnt;
-        baroIvalSum = 0; baroIvalCnt = 0;
+        float mean = 0.001f * (float)baroIvalSumUs / (float)baroIvalCnt;
+        baroIvalSumUs = 0; baroIvalCnt = 0;
         // ! reset is unconditional - inside the vzCadenceOK branch the counters
         //   would never reset again after a trip
         if (vzCadenceOK && (mean < CADENCE_MEAN_LO_MS || mean > CADENCE_MEAN_HI_MS)) {
             vzCadenceOK = false;
             vzTrusted   = false;
-            vwVz.reset();   // scaled votes gathered before the trip are void
+            vwVz.reset();
             logMsg("[WARN] vz deploy path disabled (baro cadence drift)");
         }
     }

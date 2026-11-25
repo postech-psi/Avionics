@@ -4,6 +4,8 @@
 #   모든 렌더는 창이 소유한 단일 타이머(RENDER_INTERVAL_MS)가 몰아서 처리한다.
 # =============================================================================
 import sys, serial, struct, threading, time, datetime, os, json, math, re, csv
+from binlog_20261122 import read_bin_frames
+from sd_status_20261122 import Monitor as SdMonitor, COLORS as SD_COLORS
 import numpy                    as np
 import pyqtgraph                as pg
 import pyqtgraph.opengl         as gl
@@ -1751,6 +1753,8 @@ class HealthPanel(QtWidgets.QWidget):
             ("gnss", "GNSS"),
             ("baro_ref", "BARO REF"),
             ("vz", "VZ PATH"),
+            ("sd", "SD CARD"),
+            ("mode", "TAILFIN MODE"),
         ]:
             row = QtWidgets.QHBoxLayout()
             # FLIGHT STATS와 같은 키 스타일을 써서 두 패널의 글자를 통일한다
@@ -1768,8 +1772,12 @@ class HealthPanel(QtWidgets.QWidget):
 
         self._last_status = {}
         self._last_health = 0
+        self.sd_monitor = SdMonitor()
+        self.replay_mode = False
+        self.control_mode = "NO DATA"
         layout.addStretch()
         self.update_health(0)
+        self.render_sd_status()
 
     def set_status(self, key, text, color):
         # 25Hz로 호출되므로 상태가 실제로 바뀔 때만 스타일 재적용
@@ -1787,10 +1795,34 @@ class HealthPanel(QtWidgets.QWidget):
         """테마 전환용 - 캐시를 비우고 마지막 상태로 다시 칠한다."""
         self._last_status.clear()
         self.update_health(self._last_health)
+        self.render_sd_status()
 
     def reset(self):
         self._last_health = 0
+        self.sd_monitor = SdMonitor()
+        self.control_mode = "NO DATA"
         self.reset_styles()
+
+    def observe_log(self, line):
+        self.sd_monitor.receive(line)
+        if "[MODE] BENCH" in line or "[TAILFIN] TEST " in line:
+            self.control_mode = "Q/VZ TEST"
+        elif "[TAILFIN] OUTPUT " in line:
+            self.control_mode = line.split("[TAILFIN] OUTPUT ", 1)[1].strip()
+        elif "[MODE] FLIGHT" in line or "[TAILFIN] FLIGHT " in line:
+            self.control_mode = "FLIGHT"
+        self.render_sd_status()
+
+    def render_sd_status(self):
+        state = self.sd_monitor.display(replay=self.replay_mode)
+        text = ("REPLAY REC" if state=="RECORDING" else "R:"+state) if self.replay_mode else state
+        self.set_status("sd", text, SD_COLORS[state])
+        prefix = "과거 로그 재생값입니다.\n" if self.replay_mode else ""
+        self.value_labels["sd"].setToolTip(prefix + self.sd_monitor.tooltip())
+        self.set_status("mode", self.control_mode,
+                        "#d97706" if self.control_mode=="Q/VZ TEST" else "#64748b")
+        self.value_labels["mode"].setToolTip(
+            "꼬리핀 출력 상태 및 과거 로그의 시험 모드입니다. PWM은 위치 피드백이 아닙니다.")
 
     @QtCore.pyqtSlot(int)
     def update_health(self, health):
@@ -2031,11 +2063,15 @@ def _raw_health(frame, note):
 
 
 def read_log_frames(path):
-    """로그 파일에서 텔레메트리 프레임을 뽑는다. 지상국 CSV·기체 raw CSV·옛 .txt 지원.
+    """PSILOG BIN·지상국 CSV·기체 raw CSV·옛 TXT에서 프레임을 읽는다.
 
     옛 형식도 읽는 이유: 이미 쌓인 실기 로그가 CSV 전환 전 것들이라
     그것들을 못 읽으면 리플레이의 의미가 절반으로 준다.
     """
+    with open(path, "rb") as probe:
+        prefix = probe.read(8)
+    if os.path.splitext(os.fspath(path))[1].lower() == ".bin" or prefix.startswith(b"PSILOG"):
+        return read_bin_frames(path)
     frames = []
     with open(path, encoding="utf-8", errors="ignore") as handle:
         first = handle.readline()
@@ -2113,6 +2149,8 @@ class LogReplayer(threading.Thread):
                         time.sleep(delay)
                 self.previous = frame["time"]
 
+                for event in frame.get("_events_before", ()):
+                    self.signals.line_received.emit(event)
                 self.signals.telemetry.emit(frame)
                 self.signals.attitude.emit(
                     frame["roll"], frame["pitch"], frame["yaw"]
@@ -2122,6 +2160,8 @@ class LogReplayer(threading.Thread):
                     frame["lat"], frame["lon"], frame["alt"]
                 )
                 self.signals.health.emit(int(frame["health"]))
+                for event in frame.get("_events_after", ()):
+                    self.signals.line_received.emit(event)
                 self.signals.replay_progress.emit(self.index + 1, len(self.frames))
                 self.index += 1
         finally:
@@ -2432,14 +2472,14 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Open flight log", os.path.join(BASE_DIR, "logs"),
-            "Flight logs (*.csv *.txt);;All files (*)"
+            "Flight logs (*.bin *.csv *.txt);;All files (*)"
         )
         if not path:
             return
 
         try:
             frames = read_log_frames(path)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             self.append_log(f"[REPLAY] 읽기 실패: {error}")
             return
         if not frames:
@@ -2452,6 +2492,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             f"{frames[-1]['time'] - frames[0]['time']:.1f}s"
         )
         self.replay_frames = frames
+        self.health_panel.replay_mode = True
         self.replay_thread = LogReplayer(
             frames, self.signals, self.plot_panel.speed()
         )
@@ -2504,6 +2545,13 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             self.stats_panel.update_stats(frame)
             self.update_mission(frame)
         last = self.replay_frames[index]
+        # Restore historical SD/mode status on seek without filling the text pane.
+        for frame in self.replay_frames[:index+1]:
+            for event in frame.get("_events_before", ()):
+                self.health_panel.observe_log(event)
+            if frame is not last:
+                for event in frame.get("_events_after", ()):
+                    self.health_panel.observe_log(event)
         self.signals.attitude.emit(last["roll"], last["pitch"], last["yaw"])
         self.signals.state.emit(last["state"])
         self.signals.health.emit(int(last["health"]))
@@ -2521,9 +2569,14 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.plot_panel.play_button.setText("❚❚")
         self.plot_panel.seek_slider.setEnabled(False)
         self.connect_button.setEnabled(True)
-        if was_running and not self._connected:
-            self._connection_text = "DISCONNECTED"
-            self._style_connection()
+        if was_running:
+            self.health_panel.replay_mode = False
+            self.health_panel.reset()
+            if not self._connected:
+                self.health_panel.sd_monitor.disconnected = True
+                self.health_panel.render_sd_status()
+                self._connection_text = "DISCONNECTED"
+                self._style_connection()
 
     @QtCore.pyqtSlot(int, int)
     def update_replay_progress(self, index, total):
@@ -2674,6 +2727,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
     def update_clock(self):
         self.clock_label.setText(datetime.datetime.now().strftime("KST %H:%M:%S"))
+        self.health_panel.render_sd_status()
         # 1초 동안 도착한 프레임 수 = 실제 텔레메트리 수신율
         self._tlm_rate = self._tlm_count
         self._tlm_count = 0
@@ -2751,6 +2805,13 @@ class GroundStationWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(bool, str)
     def update_connection_state(self, connected, text):
         self._connected = connected
+        self.health_panel.replay_mode = False
+        if connected:
+            self.health_panel.sd_monitor = SdMonitor()
+            self.health_panel.control_mode = "NO DATA"
+        else:
+            self.health_panel.sd_monitor.disconnected = True
+        self.health_panel.render_sd_status()
         self._connection_text = text
         self._style_connection()
         self.connect_button.setText("DISCONNECT" if connected else "CONNECT")
@@ -2774,6 +2835,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str)
     def append_log(self, line):
+        self.health_panel.observe_log(line)
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self._pending_log.append(f"{timestamp} {line}")
 

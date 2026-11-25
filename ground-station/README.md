@@ -85,14 +85,22 @@ Playback starts immediately. Use the pause/play button, select a speed from
 1× to 50×, or drag the slider to inspect a particular point in the flight.
 Seeking rebuilds the plotted history and flight statistics up to that point.
 
-The reader accepts ground station CSV recordings, flight-computer SD CSV files
-such as `flight_000.csv`, and older TXT logs containing telemetry rows. The
-current event-only TXT files do not contain frames for replay; open the paired
-CSV instead.
+The reader accepts aircraft PSILOG BIN files, ground station CSV recordings,
+older aircraft SD CSV files, and legacy TXT with telemetry rows. BIN replay
+reads the sensor health byte and stored events. Older CSV can use the `note`
+column for health status. For a standalone event TXT, open the paired CSV to
+replay the telemetry.
 
-For current SD CSV files, sensor status comes from the `note` column. Older
-files without encoded health information use a limited estimate based on the
-stored values, so their status display is less complete.
+From the repository root, decode a copy of the aircraft BIN for analysis.
+
+```powershell
+python ground-station/binlog_20261122.py "C:\logs\flight_000.bin"
+```
+
+The converter creates `flight_000.csv` and `flight_000.txt` beside the BIN and
+refuses to overwrite existing files. Keep the original BIN. Skipped-byte counts
+identify corruption or an incomplete record in the readable file. `SD CARD`
+reports the aircraft writer while `REC` tracks the PC recording.
 
 ## Prepare offline maps
 

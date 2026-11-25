@@ -22,7 +22,6 @@
 #define ukf_h_
 #include <cmath>
 #include "rtwtypes.h"
-#include "coder_bounded_array.h"
 #define ukf_M                          (rtM)
 
 extern "C"
@@ -52,17 +51,10 @@ class kf final
  public:
   // Block signals and states (default storage) for system '<Root>'
   struct DW {
-    coder::bounded_array<real_T,100,2> history_buffer;// '<Root>/Apogee_predictor' 
     real_T x_hat[2];                   // '<Root>/Kalman_Filter'
     real_T P_a[4];                     // '<Root>/Kalman_Filter'
-    real_T theta[3];                   // '<Root>/Apogee_predictor'
-    real_T P_g[9];                     // '<Root>/Apogee_predictor'
-    real_T c_x_data[50];
     real_T sigma_points[10];
     real_T propagated_points[10];
-    real_T K[9];
-    real_T dv[9];
-    boolean_T b_x_data[50];
     boolean_T is_initialized_not_empty;// '<Root>/Kalman_Filter'
   };
 
@@ -70,15 +62,12 @@ class kf final
   struct ExtU {
     real_T accel_z_in;                 // '<Root>/accel_z_in'
     real_T baro_altitude_in;           // '<Root>/baro_altitude_in'
-    real_T current_time_in;            // '<Root>/current_time_in'
   };
 
   // External outputs (root outports fed by signals with default storage)
   struct ExtY {
     real_T kf_altitude_out;            // '<Root>/kf_altitude_out'
     real_T kf_velocity_out;            // '<Root>/kf_velocity_out'
-    real_T apogee_out;                 // '<Root>/apogee_out'
-    real_T r2_out;                     // '<Root>/r2_out'
   };
 
   // Real-time Model Data Structure
@@ -109,11 +98,9 @@ class kf final
   // External outputs
   ExtY rtY;
 
-  // model initialize function
-  void initialize();
-
-  // model step function
-  void step();
+  // Process one accepted barometer observation. dt is elapsed seconds;
+  // dt == 0 anchors altitude without reporting a velocity (startup or gap).
+  void step(real_T dt);
 
   // Constructor
   kf();
@@ -151,7 +138,6 @@ class kf final
 //  Here is the system hierarchy for this model
 //
 //  '<Root>' : 'ukf'
-//  '<S1>'   : 'ukf/Apogee_predictor'
 //  '<S2>'   : 'ukf/Kalman_Filter'
 
 #endif                                 // ukf_h_
