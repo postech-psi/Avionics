@@ -60,7 +60,17 @@ bad inputs is a software response and does not cover a stalled core or lost powe
 | UKF and recovery | Timing tests cover jitter, sensor gaps and re-anchoring. The variable interval changes the velocity seen by the existing deployment logic. | I²C completion is a sample-time proxy. Compare `[BMP]` intervals, velocity and state transitions against hardware captures. |
 | GRU | Predictions run in slices after the decision and telemetry enqueue. A synthetic window at 600 m and zero vertical speed produced about 543 m. | Treat predictions as diagnostic. Compare to a physics baseline and independent flight logs. The 6 ms entry guard is not a hard slice deadline. Check `cpu_us`, `age_us` and `deadline skips` on the board. |
 | Tail fins | Host checks cover the mounting rotation, gyro signs, neutral and stale timing. | Verify the installed axes, physical fin order and pulse widths. A PWM command is not position feedback. |
-| SD and IPC | The heartbeat reports recent successful sample sync and local queue drops. BIN verifies each stored record with CRC16. | IPC rejects and M7 queue loss happen before the SD queue. A green badge does not prove a complete log. Separate data and event queues can change their relative order in the file. |
+| SD and IPC | The heartbeat reports recent successful sample sync and local queue drops. BIN verifies each stored record with CRC16. | IPC rejects and M7 queue loss happen before the SD queue. A green badge does not prove a complete log. Separate SD data and event queues can change their relative order in the file. |
+
+The included RENEWAL startup captures report actual IPC checksum rejects.
+The pinned Arduino RPC receive ring is 512 bytes. An M4 receive stall can
+therefore lose data before either storage writer. The QSPI branch moves SD
+mount/probe off the receive loop. The captures alone do not identify which
+messages were rejected or prove that startup was the only trigger.
+
+The flight code has no configured watchdog. A stalled M7 loop stops updating
+the recovery state machine. The servo driver can repeat the last commanded
+pulse while its timer still runs. Check this independently of storage.
 
 ## Battery disconnect, replay and conversion
 
@@ -75,28 +85,10 @@ Keep the original BIN. Use **OPEN LOG** to play it directly, or run the
 samples as CSV and events as TXT and does not rewrite the BIN. The reverse trip
 cannot recreate original record order, CRCs, or values rounded in CSV.
 
-## QSPI implementation plan
+## QSPI recording
 
-1. **Inventory the board read-only.** The installed PlatformIO M4 framework
-   includes `QSPIFBlockDevice`. Verify the actual JEDEC geometry and partition
-   table on a spare Portenta. Identify an available user region and confirm
-   it does not overlap Wi-Fi, OTA, provisioning, or existing user data. Keep
-   QSPI disabled if the expected region is absent. No automatic reformat or
-   repartition. [Arduino flash and partitions guide](https://docs.arduino.cc/tutorials/portenta-h7/reading-writing-flash-memory/)
-2. **Prototype one owner on M4.** Start with a bounded append file on a
-   dedicated user partition and a separate QSPI worker/queue so slow erase,
-   program or sync operations do not back up SD or XBee. Use the same PSILOG
-   record encoding. Size a session from measured capacity. At 100 Hz, 10 min
-   uses about 5.82 MB for sensors plus events and storage overhead. Stop when
-   full and report it. Leave older sessions in place until exported.
-3. **Add retrieval and independent status.** Export the original BIN over a
-   read-only service path while recording is stopped. Report per-medium
-   committed sample counts, failures and drops. Add a source sequence number
-   and firmware/schema metadata in a versioned format if exact gaps and
-   matching between replicas are required. Keep the reader compatible with v1.
-4. **Verify on a spare board before enabling it on the vehicle.** Start with
-   known test records and inspect decoded counts, gaps and CRC failures. Compare
-   SD-only and dual-write timing, then test without SD, with QSPI full, and with
-   controlled power cuts while writing. Measure how much data remains readable
-   on each medium after reboot. Both media share the board power supply and can
-   lose their uncommitted tail at the same time.
+[QSPI bench implementation](QSPI_LOGGING.md) adds a separate M4 writer with
+operator start/stop and USB export. Confirm the actual flash layout, XBee
+return path, sync latency and power loss on the board before relying on it.
+Source sequence numbers and a schema identifier remain useful if exact gaps
+and matching between storage media are required.

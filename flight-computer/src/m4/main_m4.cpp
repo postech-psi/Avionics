@@ -20,6 +20,9 @@
 #include "../shared/ipc_protocol.h"
 #include "sd_log_format_20261122.h"
 #include "sd_status_20261122.h"
+#ifdef AVIONICS_QSPI_LOG
+#include "qspi_log.h"
+#endif
 #include "SDMMCBlockDevice.h"
 #include "FATFileSystem.h"
 #include "filesystem/File.h"
@@ -42,6 +45,7 @@ static SDMMCBlockDevice sd_bd;
 static mbed::FATFileSystem sd_fs("fs");
 static mbed::File sdFile;
 static std::atomic<bool> sdOK{false};
+static std::atomic<bool> sdInitDone{false};
 static mbed::CircularBuffer<PackedSensorData, 512> sdRing;
 static std::atomic<uint32_t> sdWritten{0};
 static std::atomic<uint32_t> sdBytes{0}, sdLastSampleSyncMs{0};
@@ -61,7 +65,6 @@ static bool g_ipcBadSeen = false;
 // M7 text arrives already stamped with the M7 mission clock (same axis as the
 // sample timestamps) and is stored as-is. M4's own lines get an "[M4 <ms>] " prefix.
 static void logPush(const uint8_t* text, uint16_t len, bool m4Origin = false) {
-    if (!sdOK.load()) return;
     LogRec lr;
     int n = 0;
     if (m4Origin) {
@@ -73,7 +76,12 @@ static void logPush(const uint8_t* text, uint16_t len, bool m4Origin = false) {
     memcpy(lr.line + n, text, cl);
     lr.line[n + cl] = '\n';
     lr.len = (uint8_t)(n + cl + 1);
-    if (logRing.full()) logDrops++; else logRing.push(lr);
+#ifdef AVIONICS_QSPI_LOG
+    qspi::push(sdlog::eventRecord,lr.line,lr.len);
+#endif
+    if (sdOK.load()) {
+        if (logRing.full()) logDrops++; else logRing.push(lr);
+    }
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -81,6 +89,9 @@ static void logPush(const uint8_t* text, uint16_t len, bool m4Origin = false) {
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 static void onData(const uint8_t* payload, uint16_t len) {
     if (len != sizeof(PackedSensorData)) return;
+#ifdef AVIONICS_QSPI_LOG
+    qspi::push(sdlog::dataRecord,payload,len);
+#endif
 
     static uint8_t lastState = 0;
     if (payload[0] == 0xBD && lastState != 0xBD) g_landedReport = true;
@@ -143,7 +154,9 @@ static void reportSdStatus(bool force=false) {
     const uint32_t now=millis();
     const uint32_t samples=sdWritten.load(std::memory_order_acquire);
     const uint32_t lastSync=sdLastSampleSyncMs.load(std::memory_order_relaxed);
-    const auto state=sdstatus::evaluate(sdOK.load(),samples,now,lastSync,sdDrops,logDrops);
+    const bool initialized = sdInitDone.load();
+    const auto state = initialized ? sdstatus::evaluate(sdOK.load(),samples,now,lastSync,sdDrops,logDrops)
+                                  : sdstatus::State::Checking;
     if (!force && state==previous && uint32_t(now-lastReport)<1000) return;
     previous=state; lastReport=now;
     char message[144];
@@ -152,12 +165,18 @@ static void reportSdStatus(bool force=false) {
         sdstatus::name(state),(unsigned long)samples,
         (unsigned long)sdBytes.load(std::memory_order_relaxed),
         (unsigned long)(samples ? uint32_t(now-lastSync) : 0),
-        (unsigned long)sdDrops,(unsigned long)logDrops,sdSessionIdx);
+        (unsigned long)sdDrops,(unsigned long)logDrops,initialized ? sdSessionIdx : -1);
     xbeeLog(message);
     logPush((const uint8_t*)message,strlen(message),true);
 }
 
+static int openSession();
+
 static void sdWriterFn() {
+    sdSessionIdx = openSession();
+    sdOK.store(sdSessionIdx >= 0);
+    sdInitDone.store(true);
+    if (!sdOK.load()) return;
     static uint8_t batch[8192];
     uint32_t lastWrite = millis();
     while (sdOK.load()) {
@@ -257,30 +276,42 @@ void setup() {
     // 0xAA prefix is mandatory - the ground station discards unprefixed text
     if (!RPC.begin()) xbeeLog("[ERROR] M4 RPC.begin() failed");
 
-    xbeeLog("[SD] CHECKING n=0 bytes=0 age=0 drop=0/0 file=-1");
-    int sessionIdx = openSession();
-    if (sessionIdx >= 0) {
-        sdOK.store(true);
-        if (sdWriter.start(mbed::callback(sdWriterFn)) != osOK) {
-            sdOK.store(false);
-            sdFile.close();
-            sessionIdx = -1;
-            sdSetupPhase="writer_thread";
-        }
+    // Mount independently so slow SD startup cannot block RPC, radio or QSPI.
+    if (sdWriter.start(mbed::callback(sdWriterFn)) != osOK) {
+        sdSetupPhase = "writer_thread";
+        sdInitDone.store(true);
     }
-    sdSessionIdx=sessionIdx;
-    char sdMsg[112];
-    if (sessionIdx >= 0)
-        snprintf(sdMsg, sizeof(sdMsg), "[SYS] SD BIN file=flight_%03d.bin (100Hz)", sessionIdx);
-    else
-        snprintf(sdMsg, sizeof(sdMsg), "[ERROR] SD disabled (phase=%s)",sdSetupPhase);
-    xbeeLog(sdMsg);
-    if (sessionIdx>=0) xbeeLog("[INIT] SD write/sync/readback OK; waiting for sensor samples");
-    logPush((const uint8_t*)sdMsg, strlen(sdMsg), true);
-    static const char renewal[] = "[INIT] M4 2026 YEAR END: PSILOG v1 BIN";
-    xbeeLog(renewal);
-    logPush((const uint8_t*)renewal, sizeof(renewal) - 1, true);
+#ifdef AVIONICS_QSPI_LOG
+    qspi::begin();
+#endif
     reportSdStatus(true);
+}
+
+static void reportStorage() {
+    static bool sdAnnounced = false;
+    if (!sdAnnounced && sdInitDone.load()) {
+        sdAnnounced = true;
+        char message[112];
+        if (sdSessionIdx >= 0)
+            snprintf(message,sizeof(message),"[SYS] SD BIN flight_%03d.bin; boot probe OK",sdSessionIdx);
+        else
+            snprintf(message,sizeof(message),"[ERROR] SD disabled (phase=%s)",sdSetupPhase);
+        xbeeLog(message);
+        logPush((const uint8_t*)message,strlen(message),true);
+    }
+    reportSdStatus();
+#ifdef AVIONICS_QSPI_LOG
+    static qspi::RadioCommands commands;
+    // Keep serial input work bounded even with a noisy radio link.
+    for (unsigned i = 0; i < 32 && Serial1.available(); ++i) {
+        const int in = Serial1.read();
+        if (in < 0) break;
+        const auto command = commands.feed(uint8_t(in));
+        if (command != qspi::Command::None) qspi::request(command);
+    }
+    char status[104];
+    if (qspi::report(status,sizeof(status),millis())) xbeeLog(status);
+#endif
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -329,7 +360,9 @@ void loop() {
 
     //### One-shot reports (flags set elsewhere, all sent from this context) ###
     if (g_sdFailReport.exchange(false)) {
-        xbeeLog("[ERROR] SD write failed - logging stopped");   // SD is dead: XBEE only
+        static const char message[] = "[ERROR] SD write failed - SD logging stopped";
+        xbeeLog(message);
+        logPush((const uint8_t*)message,sizeof(message)-1,true);
     }
     if (g_ipcBadReport) {
         g_ipcBadReport = false;
@@ -348,6 +381,6 @@ void loop() {
         logPush((const uint8_t*)m, strlen(m), true);
     }
 
-    reportSdStatus();
-    delay(1);   // yield to sdWriter; 1ms polling is ample for 100Hz
+    reportStorage();
+    delay(1);   // yield to the storage workers
 }

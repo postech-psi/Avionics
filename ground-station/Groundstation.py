@@ -1887,6 +1887,14 @@ class SerialReader(threading.Thread):
         # packet_size     : 시작바이트를 뺀 91B (종료바이트 0x0A 포함)
         # ! telemetry_frame.h 의 PackedSensorData 90B와 반드시 일치해야 한다
 
+    def set_qspi_recording(self, start):
+        port = self.ser
+        if not self.running or port is None:
+            raise serial.SerialException("XBee port is closed")
+        command = b"\nPSIQ START\n" if start else b"\nPSIQ STOP\n"
+        if port.write(command) != len(command):
+            raise serial.SerialException("Incomplete QSPI command")
+
     def stop(self):
         self.running = False
         if self.ser:
@@ -1923,7 +1931,7 @@ class SerialReader(threading.Thread):
 
     def run(self):
         try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            self.ser = serial.Serial(self.port, self.baud, timeout=1, write_timeout=0.2)
             self.signals.connection_changed.emit(
                 True, f"CONNECTED  {self.port} @ {self.baud}"
             )
@@ -2190,6 +2198,9 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self._tlm_display = None
         self._connected = False
         self._connection_text = "DISCONNECTED"
+        self._qspi_status = None
+        self._qspi_last_report = 0.0
+        self._qspi_pending = None
         self._log_filename = None
         self._pending_log = []
 
@@ -2297,6 +2308,11 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         toolbar.addWidget(self.connect_button)
         toolbar.addWidget(self.start_log_button)
         toolbar.addWidget(self.stop_log_button)
+        self.qspi_button = QtWidgets.QPushButton("START QSPI")
+        self.qspi_button.setEnabled(False)
+        self.qspi_label = QtWidgets.QLabel("QSPI —")
+        toolbar.addWidget(self.qspi_button)
+        toolbar.addWidget(self.qspi_label)
 
         self.log_status_label = QtWidgets.QLabel()
         self.log_status_label.setAlignment(QtCore.Qt.AlignCenter)
@@ -2453,6 +2469,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
         self.connect_button.clicked.connect(self.toggle_serial)
         self.start_log_button.clicked.connect(self.start_logging)
         self.stop_log_button.clicked.connect(self.stop_logging)
+        self.qspi_button.clicked.connect(self.toggle_qspi_recording)
         self.reset_button.clicked.connect(self.reset_all)
         self.theme_button.clicked.connect(self.toggle_theme)
         self.plot_panel.open_button.clicked.connect(self.open_replay)
@@ -2727,6 +2744,7 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
     def update_clock(self):
         self.clock_label.setText(datetime.datetime.now().strftime("KST %H:%M:%S"))
+        self.render_qspi_status()
         self.health_panel.render_sd_status()
         # 1초 동안 도착한 프레임 수 = 실제 텔레메트리 수신율
         self._tlm_rate = self._tlm_count
@@ -2805,6 +2823,9 @@ class GroundStationWindow(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(bool, str)
     def update_connection_state(self, connected, text):
         self._connected = connected
+        self._qspi_status = None
+        self._qspi_pending = None
+        self.render_qspi_status()
         self.health_panel.replay_mode = False
         if connected:
             self.health_panel.sd_monitor = SdMonitor()
@@ -2833,8 +2854,40 @@ class GroundStationWindow(QtWidgets.QMainWindow):
             "color: #f87171; font-weight: bold; padding: 5px;"
         )
 
+    def toggle_qspi_recording(self):
+        if not self._connected or not self.qspi_button.isEnabled() or not self.serial_thread:
+            return
+        start = self._qspi_status == "IDLE"
+        try:
+            self.serial_thread.set_qspi_recording(start)
+        except serial.SerialException as error:
+            self.append_log(f"[ERROR] QSPI command failed: {error}")
+            return
+        self._qspi_pending = (self._qspi_status, time.monotonic() + 4.0)
+        self.render_qspi_status()
+
+    def render_qspi_status(self):
+        now = time.monotonic()
+        current = self._qspi_status if self._connected and now - self._qspi_last_report < 3.5 else None
+        if self._qspi_pending and now >= self._qspi_pending[1]:
+            self._qspi_pending = None
+            self.append_log("[WARN] No aircraft confirmation for the QSPI command")
+        text = "WAIT ACK" if self._qspi_pending else current or "—"
+        self.qspi_label.setText(f"QSPI {text}")
+        can_stop = current in ("STARTING", "ARMED", "RECORDING", "STALE", "DEGRADED")
+        self.qspi_button.setText("STOP QSPI" if can_stop else "START QSPI")
+        self.qspi_button.setEnabled(not self._qspi_pending and (current == "IDLE" or can_stop))
+
     @QtCore.pyqtSlot(str)
     def append_log(self, line):
+        status = re.fullmatch(r"\[QSPI\] ([A-Z]+) n=(\d+) bytes=(\d+) drop=(\d+) file=(-?\d+)", line)
+        if status and self._connected:
+            self._qspi_status = status[1]
+            self._qspi_last_report = time.monotonic()
+            self.qspi_label.setToolTip(f"Session {status[5]} · {status[2]} samples synced · {status[4]} queue drops")
+            if self._qspi_pending and self._qspi_status != self._qspi_pending[0]:
+                self._qspi_pending = None
+            self.render_qspi_status()
         self.health_panel.observe_log(line)
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         self._pending_log.append(f"{timestamp} {line}")

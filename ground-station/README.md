@@ -102,6 +102,12 @@ refuses to overwrite existing files. Keep the original BIN. Skipped-byte counts
 identify corruption or an incomplete record in the readable file. `SD CARD`
 reports the aircraft writer while `REC` tracks the PC recording.
 
+## QSPI recording
+
+With QSPI-enabled firmware, **START QSPI** opens a new aircraft BIN file and
+**STOP QSPI** closes it. Check the aircraft status before relying on the log.
+The [QSPI guide](../flight-computer/docs/QSPI_LOGGING.md) covers setup and USB export.
+
 ## Prepare offline maps
 
 Download maps while internet access is available. From `ground-station/`:
