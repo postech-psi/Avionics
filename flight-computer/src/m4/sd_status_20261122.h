@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <cerrno>
 
 namespace sdstatus {
 enum class State { Checking, Ready, Recording, Stale, Degraded, Error };
@@ -27,17 +28,20 @@ inline State evaluate(bool open, uint32_t samples, uint32_t now, uint32_t lastSa
 
 // Shared by startup probe and normal logging. A sync retry never rewrites data.
 template<class File, class Pause>
-bool writeAndSync(File& file, const uint8_t* bytes, size_t size, Pause pause) {
+int writeAndSync(File& file, const uint8_t* bytes, size_t size, Pause pause) {
     while (size) {
-        const auto count=file.write(bytes,size);
-        if (count<=0 || size_t(count)>size) return false;
+        const auto count = file.write(bytes,size);
+        if (count < 0) return static_cast<int>(count);
+        if (count == 0 || size_t(count)>size) return -EIO;
         bytes+=count; size-=size_t(count);
     }
+    int result = 0;
     for (int attempt=0;attempt<3;++attempt) {
-        if (file.sync()==0) return true;
-        pause();
+        result = file.sync();
+        if (result == 0 || result == -ENOSPC) return result;
+        if (attempt < 2) pause();
     }
-    return false;
+    return result;
 }
 template<class File>
 bool verifyProbe(File& file,const uint8_t* expected,size_t size) {

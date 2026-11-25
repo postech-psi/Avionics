@@ -99,8 +99,13 @@ python ground-station/binlog_20261122.py "C:\logs\flight_000.bin"
 
 The converter creates `flight_000.csv` and `flight_000.txt` beside the BIN and
 refuses to overwrite existing files. Keep the original BIN. Skipped-byte counts
-identify corruption or an incomplete record in the readable file. `SD CARD`
-reports the aircraft writer while `REC` tracks the PC recording.
+identify corruption or an incomplete record in the readable file. The TXT
+marks rejected inter-core candidates as `[IPC_RAW]` with M4 time, wire-byte
+offset, reason and original hex. `[BIN_DAMAGE]` marks skipped on-disk bytes
+with file offsets and hex. These are preserved for offline analysis and do
+not enter the telemetry CSV or plots. Use `--salvage` for a known BIN with a
+damaged header. Both PSILOG v1 and v2 remain readable. `SD CARD` reports the
+aircraft writer while `REC` tracks the PC recording.
 
 ## QSPI recording
 

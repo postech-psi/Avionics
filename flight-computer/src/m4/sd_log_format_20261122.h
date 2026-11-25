@@ -3,12 +3,25 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include "../shared/ipc_protocol.h"
 
 namespace sdlog {
 
-constexpr uint8_t fileHeader[] = {'P', 'S', 'I', 'L', 'O', 'G', 1, 0};
+constexpr uint8_t fileHeader[] = {'P', 'S', 'I', 'L', 'O', 'G', 2, 0};
 constexpr uint8_t dataRecord = 1;
 constexpr uint8_t eventRecord = 2;
+constexpr uint8_t ipcRawRecord = 3;
+constexpr size_t rawHeader = 9;  // reason, M4 millis (LE32), stream offset (LE32)
+constexpr size_t maxPayload = rawHeader+ipc::maxFrameBytes;
+struct Record {
+    uint8_t kind;
+    uint16_t len;
+    uint8_t payload[maxPayload];
+};
+
+inline void put32(uint8_t* dst, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) dst[i] = uint8_t(value >> (8*i));
+}
 constexpr size_t recordOverhead = 7;
 
 // CRC-16/CCITT-FALSE over the type, little-endian length and payload.

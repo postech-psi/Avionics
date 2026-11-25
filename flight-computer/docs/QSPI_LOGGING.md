@@ -46,16 +46,23 @@ running. There is no automatic start when SD fails, which avoids filling
 flash without approval. Commands need a working ground-to-air XBee path and
 rely on the configured radio network for access control.
 
-A session caps at 5 MiB, roughly nine minutes at 100 Hz before text events.
-`LIMIT`, `FULL`, or `ERROR` ends QSPI recording for that boot. Sessions are
-never overwritten or automatically deleted. `DEGRADED` reports local queue
-drops and `STALE` means no recent sensor sync. Both media can miss frames
-lost upstream in the M7→M4 stream.
+QSPI stops six minutes after a session opens, or 30 seconds after it sees a
+`LANDED` transition in that session, whichever comes first. **STOP QSPI**
+closes it sooner. When the status returns to `IDLE`, **START QSPI** opens a new
+numbered BIN if space remains. A later session started while already landed
+has its own six-minute window. Closed files are preserved.
+
+The 5 MiB per-file limit is a second guard against bursts and malformed data.
+It closes the file and returns to `IDLE`. `FULL` means the volume or file
+numbers are exhausted. `ERROR` means the writer stopped on an I/O failure.
+`STALE` means no recent sensor sync; `DEGRADED` means records were dropped.
+The stop reason is reported in status and, on clean close, in the BIN footer.
 
 ## 벤치 확인
 
 With the board secured and actuators disconnected, check a start/stop cycle
-and export the file. Repeat with the SD card absent and confirm QSPI sample
+and restart into a new file without a board reset. Repeat with the SD card
+absent and confirm QSPI sample
 counts rise. Compare reset and controlled power-cut results on QSPI and SD.
 LittleFS commits file data at sync/close and is designed for power-loss
 recovery. The writer aims to sync every 200 ms, but backlog and write latency

@@ -2880,11 +2880,12 @@ class GroundStationWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str)
     def append_log(self, line):
-        status = re.fullmatch(r"\[QSPI\] ([A-Z]+) n=(\d+) bytes=(\d+) drop=(\d+) file=(-?\d+)", line)
+        status = re.fullmatch(r"\[QSPI\] ([A-Z]+) n=(\d+) bytes=(\d+) drop=(\d+) file=(-?\d+)(?: stop=([a-z]+))?", line)
         if status and self._connected:
             self._qspi_status = status[1]
             self._qspi_last_report = time.monotonic()
-            self.qspi_label.setToolTip(f"Session {status[5]} · {status[2]} samples synced · {status[4]} queue drops")
+            note = f" · Stop: {status[6]}" if status[6] and status[6] != "none" else ""
+            self.qspi_label.setToolTip(f"Session {status[5]} · {status[2]} samples synced · {status[4]} dropped{note}")
             if self._qspi_pending and self._qspi_status != self._qspi_pending[0]:
                 self._qspi_pending = None
             self.render_qspi_status()

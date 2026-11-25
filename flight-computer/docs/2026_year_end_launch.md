@@ -1,7 +1,7 @@
 # 2026 year-end launch integration review
 
 This branch combines the variable-interval UKF and diagnostic GRU from
-`flight-computer.zip` with the tail-fin control math and PSILOG v1 from
+`flight-computer.zip` with the tail-fin control math and original PSILOG format from
 `Avionics-main-RENEWAL.zip`. M7 still owns flight decisions, M4 owns aircraft
 storage and XBee, and the dashboard still records its own CSV/TXT from the radio.
 The actual units and field mapping are in the [firmware guide](../README.md).
@@ -64,9 +64,18 @@ bad inputs is a software response and does not cover a stalled core or lost powe
 
 The included RENEWAL startup captures report actual IPC checksum rejects.
 The pinned Arduino RPC receive ring is 512 bytes. An M4 receive stall can
-therefore lose data before either storage writer. The QSPI branch moves SD
-mount/probe off the receive loop. The captures alone do not identify which
-messages were rejected or prove that startup was the only trigger.
+therefore lose data before either storage writer. Arduino `RPC.write()` also
+returns the requested length regardless of the underlying send result. SD
+mount/probe runs off the receive loop. PSILOG v2 records the exact suspect
+bytes that reached M4 with their offsets and the parser's reason. Bytes lost
+before M4 are unrecoverable, and XOR cannot detect all multi-byte errors.
+
+On SD write or sync failure, the writer keeps the pending batch in RAM and
+retries after reopening a new numbered file. The earlier file can contain
+a prefix or complete copy of that batch. Combine files using sample mission
+times and compare duplicates during post-processing. RAM queues are bounded.
+A long failure can drop records, and an abrupt power loss can lose the
+uncommitted batch on either medium.
 
 The flight code has no configured watchdog. A stalled M7 loop stops updating
 the recovery state machine. The servo driver can repeat the last commanded

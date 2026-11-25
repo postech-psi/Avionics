@@ -17,7 +17,7 @@
 #include <cstdio>
 #include <fcntl.h>
 #include "../shared/telemetry_frame.h"
-#include "../shared/ipc_protocol.h"
+#include "ipc_receiver.h"
 #include "sd_log_format_20261122.h"
 #include "sd_status_20261122.h"
 #ifdef AVIONICS_QSPI_LOG
@@ -49,12 +49,12 @@ static std::atomic<bool> sdInitDone{false};
 static mbed::CircularBuffer<PackedSensorData, 512> sdRing;
 static std::atomic<uint32_t> sdWritten{0};
 static std::atomic<uint32_t> sdBytes{0}, sdLastSampleSyncMs{0};
-static int sdSessionIdx=-1;
-static const char* sdSetupPhase="mount";
+static std::atomic<int> sdSessionIdx{-1};
+static bool sdMounted = false;  // writer thread only
+static std::atomic<const char*> sdSetupPhase{"mount"};
 static uint32_t sdDrops = 0;
 
-struct LogRec { uint8_t len; char line[150]; };
-static mbed::CircularBuffer<LogRec, 48> logRing;
+static mbed::CircularBuffer<sdlog::Record, 48> logRing;
 static uint32_t logDrops = 0;
 static uint32_t ipcBadFrames = 0;
 static std::atomic<bool> g_sdFailReport{false};
@@ -62,26 +62,42 @@ static bool g_landedReport = false;
 static bool g_ipcBadReport = false;
 static bool g_ipcBadSeen = false;
 
-// M7 text arrives already stamped with the M7 mission clock (same axis as the
-// sample timestamps) and is stored as-is. M4's own lines get an "[M4 <ms>] " prefix.
-static void logPush(const uint8_t* text, uint16_t len, bool m4Origin = false) {
-    LogRec lr;
-    int n = 0;
-    if (m4Origin) {
-        n = snprintf(lr.line, sizeof(lr.line), "[M4 %lu] ", (unsigned long)millis());
-        if (n < 0 || (size_t)n >= sizeof(lr.line)) return;
-    }
-    size_t maxTxt = sizeof(lr.line) - (size_t)n - 1;
-    size_t cl = (len > maxTxt) ? (uint16_t)maxTxt : len;
-    memcpy(lr.line + n, text, cl);
-    lr.line[n + cl] = '\n';
-    lr.len = (uint8_t)(n + cl + 1);
+// M7 text arrives already stamped. M4's own lines get an "[M4 <ms>] " prefix.
+static void pushRecord(const sdlog::Record& record) {
 #ifdef AVIONICS_QSPI_LOG
-    qspi::push(sdlog::eventRecord,lr.line,lr.len);
+    qspi::push(record.kind,record.payload,record.len);
 #endif
-    if (sdOK.load()) {
-        if (logRing.full()) logDrops++; else logRing.push(lr);
+    if (logRing.full()) ++logDrops; else logRing.push(record);
+}
+
+static void logPush(const uint8_t* text, uint16_t len, bool m4Origin = false) {
+    sdlog::Record record{};
+    record.kind = sdlog::eventRecord;
+    int prefix = 0;
+    if (m4Origin) {
+        prefix = snprintf(reinterpret_cast<char*>(record.payload),sizeof(record.payload),
+                          "[M4 %lu] ",(unsigned long)millis());
+        if (prefix < 0 || size_t(prefix) >= sizeof(record.payload)) return;
     }
+    const size_t room = sizeof(record.payload)-prefix-1;
+    const auto copy = len > room ? room : len;
+    memcpy(record.payload+prefix,text,copy);
+    record.payload[prefix+copy] = '\n';
+    record.len = prefix+copy+1;
+    pushRecord(record);
+}
+
+static void logRaw(ipc::Reject reason, uint32_t offset, const uint8_t* data, size_t length) {
+    sdlog::Record record{};
+    record.kind = sdlog::ipcRawRecord;
+    record.payload[0] = static_cast<uint8_t>(reason);
+    sdlog::put32(record.payload+1,millis());
+    sdlog::put32(record.payload+5,offset);
+    memcpy(record.payload+sdlog::rawHeader,data,length);
+    record.len = sdlog::rawHeader+length;
+    pushRecord(record);
+    ++ipcBadFrames;
+    if (!g_ipcBadSeen) { g_ipcBadSeen = true; g_ipcBadReport = true; }
 }
 
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
@@ -94,17 +110,20 @@ static void onData(const uint8_t* payload, uint16_t len) {
 #endif
 
     static uint8_t lastState = 0;
-    if (payload[0] == 0xBD && lastState != 0xBD) g_landedReport = true;
+    if (payload[0] == 0xBD && lastState != 0xBD) {
+        g_landedReport = true;
+#ifdef AVIONICS_QSPI_LOG
+        qspi::noteLanding(millis());
+#endif
+    }
     lastState = payload[0];
 
-    if (sdOK.load()) {
-        if (sdRing.full()) {
-            sdDrops++;
-        } else {
-            PackedSensorData sample;
-            memcpy(&sample, payload, sizeof(sample));
-            sdRing.push(sample);
-        }
+    if (sdRing.full()) {
+        ++sdDrops;
+    } else {
+        PackedSensorData sample;
+        memcpy(&sample,payload,sizeof(sample));
+        sdRing.push(sample);
     }
     if (++g_telemCount >= TELEM_DECIMATE) {
         g_telemCount = 0;
@@ -144,7 +163,7 @@ static void dispatch(uint8_t type, const uint8_t* payload, uint16_t len) {
 static rtos::Thread sdWriter(osPriorityBelowNormal, 8192, nullptr, "sdwriter");
 
 static bool writeAndSync(const uint8_t* bytes, size_t size) {
-    return sdstatus::writeAndSync(sdFile,bytes,size,[](){ delay(10); });
+    return sdstatus::writeAndSync(sdFile,bytes,size,[](){ delay(10); }) == 0;
 }
 
 // Called only from loop/setup, so status text cannot interleave XBee frames.
@@ -165,7 +184,7 @@ static void reportSdStatus(bool force=false) {
         sdstatus::name(state),(unsigned long)samples,
         (unsigned long)sdBytes.load(std::memory_order_relaxed),
         (unsigned long)(samples ? uint32_t(now-lastSync) : 0),
-        (unsigned long)sdDrops,(unsigned long)logDrops,initialized ? sdSessionIdx : -1);
+        (unsigned long)sdDrops,(unsigned long)logDrops,initialized ? sdSessionIdx.load() : -1);
     xbeeLog(message);
     logPush((const uint8_t*)message,strlen(message),true);
 }
@@ -173,48 +192,64 @@ static void reportSdStatus(bool force=false) {
 static int openSession();
 
 static void sdWriterFn() {
-    sdSessionIdx = openSession();
-    sdOK.store(sdSessionIdx >= 0);
-    sdInitDone.store(true);
-    if (!sdOK.load()) return;
     static uint8_t batch[8192];
+    size_t used = 0;
+    uint32_t samples = 0;
     uint32_t lastWrite = millis();
-    while (sdOK.load()) {
+    while (true) {
+        if (!sdOK.load()) {
+            const int id = openSession();
+            sdSessionIdx.store(id);
+            sdInitDone.store(true);
+            if (id < 0) {
+                if (sdMounted) { sd_fs.unmount(); sdMounted = false; }
+                delay(2000);
+                continue;
+            }
+            sdWritten.store(0);
+            sdLastSampleSyncMs.store(millis());
+            sdOK.store(true);
+        }
         const uint32_t now = millis();
-        if (now - lastWrite < 200 || (sdRing.empty() && logRing.empty())) {
+        if (now-lastWrite < 200 || (!used && sdRing.empty() && logRing.empty())) {
             delay(1);
             continue;
         }
         lastWrite = now;
 
-        size_t used = 0;
-        uint32_t samples = 0;
-        PackedSensorData sample;
-        LogRec event;
-        for (;;) {
-            const size_t previous = used;
-            if (sizeof(batch) - used >= sizeof(sample) + sdlog::recordOverhead
-                && sdRing.pop(sample)) {
-                used += sdlog::encode(batch + used, sdlog::dataRecord, &sample, sizeof(sample));
-                samples++;
+        if (!used) {
+            PackedSensorData sample;
+            sdlog::Record event;
+            for (;;) {
+                const size_t previous = used;
+                if (sizeof(batch)-used >= sizeof(sample)+sdlog::recordOverhead && sdRing.pop(sample)) {
+                    used += sdlog::encode(batch+used,sdlog::dataRecord,&sample,sizeof(sample));
+                    ++samples;
+                }
+                if (sizeof(batch)-used >= sdlog::maxPayload+sdlog::recordOverhead && logRing.pop(event)) {
+                    used += sdlog::encode(batch+used,event.kind,event.payload,event.len);
+                }
+                if (used == previous) break;
             }
-            if (sizeof(batch) - used >= sizeof(event.line) + sdlog::recordOverhead
-                && logRing.pop(event)) {
-                used += sdlog::encode(batch + used, sdlog::eventRecord, event.line, event.len);
-            }
-            if (used == previous) break;
         }
-        if (used > 0 && !writeAndSync(batch, used)) {
+        if (!writeAndSync(batch,used)) {
+            // The old file may contain a partial or already synced batch.
+            // Retain the exact batch, and retry only into a new file.
             sdOK.store(false);
-            g_sdFailReport.store(true);  // XBee notices are sent from loop().
+            g_sdFailReport.store(true);
             sdFile.close();
-            return;
+            sd_fs.unmount();
+            sdMounted = false;
+            delay(2000);
+            continue;
         }
-        sdBytes.fetch_add((uint32_t)used,std::memory_order_relaxed);
+        sdBytes.fetch_add(uint32_t(used),std::memory_order_relaxed);
         if (samples) {
             sdLastSampleSyncMs.store(millis(),std::memory_order_relaxed);
             sdWritten.fetch_add(samples,std::memory_order_release);
         }
+        used = 0;
+        samples = 0;
     }
 }
 
@@ -224,6 +259,7 @@ static void sdWriterFn() {
 static int openSession() {
     sdSetupPhase="mount";
     if (sd_fs.mount(&sd_bd) != 0) return -1;
+    sdMounted = true;
 
     // Reserve old CSV/TXT session numbers too, so the matching PC outputs
     // never collide with names already assigned on this card.
@@ -288,14 +324,15 @@ void setup() {
 }
 
 static void reportStorage() {
-    static bool sdAnnounced = false;
-    if (!sdAnnounced && sdInitDone.load()) {
-        sdAnnounced = true;
+    static int announced = -2;
+    const int current = sdOK.load() ? sdSessionIdx.load() : -1;
+    if (sdInitDone.load() && current != announced) {
+        announced = current;
         char message[112];
-        if (sdSessionIdx >= 0)
-            snprintf(message,sizeof(message),"[SYS] SD BIN flight_%03d.bin; boot probe OK",sdSessionIdx);
+        if (current >= 0)
+            snprintf(message,sizeof(message),"[SYS] SD BIN flight_%03d.bin; probe OK",current);
         else
-            snprintf(message,sizeof(message),"[ERROR] SD disabled (phase=%s)",sdSetupPhase);
+            snprintf(message,sizeof(message),"[ERROR] SD unavailable (phase=%s)",sdSetupPhase.load());
         xbeeLog(message);
         logPush((const uint8_t*)message,strlen(message),true);
     }
@@ -318,40 +355,18 @@ static void reportStorage() {
 //~~~~~~~~~~~~~~~~~~ [6] Main Loop (1ms polling) ~~~~~~~~~~~~~~~~//
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 void loop() {
-    //### IPC state machine: 0=START 1=TYPE 2=LEN_L 3=LEN_H 4=payload 5=CHECK ###
-    static int      st   = 0;
-    static uint8_t  type = 0, ck = 0;
-    static uint16_t need = 0, got = 0;
-    static uint8_t  payload[ipc::IPC_MAX_PAYLOAD];
-
-    while (RPC.available()) {
-        uint8_t b = (uint8_t)RPC.read();
-        switch (st) {
-            case 0: if (b == ipc::IPC_START) st = 1; break;
-            case 1: type = b; ck  = b; st = 2; break;
-            case 2: need = b; ck ^= b; st = 3; break;
-            case 3:
-                need |= (uint16_t)b << 8; ck ^= b;
-                got = 0;
-                if (need > sizeof(payload)) st = 0;      // abnormal length -> resync
-                else st = (need == 0) ? 5 : 4;
-                break;
-            case 4:
-                payload[got++] = b; ck ^= b;
-                if (got >= need) st = 5;
-                break;
-            default:
-                // ! verify before anything is believed - a length-only check
-                //   accepts frames spliced from two others (README 6.10)
-                if (b == ck) dispatch(type, payload, need);
-                else {
-                    ipcBadFrames++;
-                    if (!g_ipcBadSeen) { g_ipcBadSeen = true; g_ipcBadReport = true; }
-                }
-                st = 0;
-                break;
-        }
+    static ipc::Receiver receiver(sizeof(PackedSensorData));
+#ifdef AVIONICS_QSPI_LOG
+    qspi::tick(millis());
+#endif
+    const uint32_t now = millis();
+    // Bounded work leaves time for radio and storage even during a raw burst.
+    for (unsigned i=0; i<512 && RPC.available(); ++i) {
+        const int byte = RPC.read();
+        if (byte < 0) break;
+        receiver.feed(uint8_t(byte),now,dispatch,logRaw);
     }
+    if (!RPC.available()) receiver.flushIdle(millis(),dispatch,logRaw);
 
     if (g_haveFrame) {
         g_haveFrame = false;
@@ -360,13 +375,13 @@ void loop() {
 
     //### One-shot reports (flags set elsewhere, all sent from this context) ###
     if (g_sdFailReport.exchange(false)) {
-        static const char message[] = "[ERROR] SD write failed - SD logging stopped";
+        static const char message[] = "[ERROR] SD write failed; retained batch will retry in a new file";
         xbeeLog(message);
         logPush((const uint8_t*)message,sizeof(message)-1,true);
     }
     if (g_ipcBadReport) {
         g_ipcBadReport = false;
-        static const char ipcBadMsg[] = "[WARN] IPC frame rejected (checksum) - inter-core byte loss";
+        static const char ipcBadMsg[] = "[WARN] IPC candidate rejected; raw bytes logged when queue space permits";
         xbeeLog(ipcBadMsg);
         logPush((const uint8_t*)ipcBadMsg, sizeof(ipcBadMsg) - 1, true);
     }

@@ -129,10 +129,11 @@ GNSS 응답 비트도 위치 fix를 보장하지 않는다.
 
 ## 5. SD 기록
 
-M4는 부팅마다 사용하지 않은 `flight_NNN.bin`을 만든다. PSILOG v1 파일에는
-센서 데이터와 이벤트가 함께 들어간다. 부팅 때 헤더와 시작 이벤트를 쓰고
+M4는 사용하지 않은 `flight_NNN.bin`을 만든다. PSILOG v2 파일에는
+센서 데이터, 이벤트, 그리고 거부된 코어 간 원시 바이트가 들어간다. 부팅 때 헤더와 시작 이벤트를 쓰고
 `sync()` 후 다시 읽어 대조한다. 센서 큐는 별도 스레드에서 약 200ms마다
-배치로 쓴다. SD 초기화나 쓰기 실패는 XBee로 알리고, SD 기록만 중단한다.
+배치로 쓴다. SD 초기화나 쓰기 실패는 XBee로 알린다. 쓰기에 실패하면
+배치를 RAM에 보관하고 SD가 복구된 뒤 새 파일에 재시도한다.
 
 지상국 **OPEN LOG**에서 BIN을 재생한다. CSV/TXT가 필요하면
 [지상국 변환 안내](../ground-station/README.md#replay-a-flight)를 참고한다.
@@ -338,5 +339,5 @@ IPC 프레임은 시작 바이트 `0xA5`, 타입, 2바이트 길이, payload, XO
 | `Baro reference quality fail` | 부팅 중 기체 움직임, 압력 변동, 샘플 수 |
 | `vz deploy path disabled` | 함께 출력된 차단 사유와 센서 상태 |
 | `SD disabled` | 카드 장착·파일시스템·남은 세션 번호 |
-| `SD write failed` | 카드 쓰기 오류. 해당 부팅의 SD 기록은 중단됨 |
+| `SD write failed` | 카드 쓰기 오류. 대기 중인 배치는 새 파일로 재시도 |
 | `RPC link` 또는 `deadline skips` | 송신 누락과 비행 루프 실행시간 |

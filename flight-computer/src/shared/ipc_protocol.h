@@ -16,6 +16,7 @@ namespace ipc {
     static const size_t  IPC_HEADER  = 4;
     static const size_t  IPC_TRAILER = 1;
     static const size_t  IPC_MAX_PAYLOAD = 250;
+    constexpr size_t maxFrameBytes = IPC_HEADER+IPC_MAX_PAYLOAD+IPC_TRAILER;
 
     // XOR of every byte after IPC_START. Shared so sender/receiver cannot drift.
     inline uint8_t checksum(const uint8_t* frame, size_t len) {

@@ -4,8 +4,6 @@ from pathlib import Path
 
 import serial
 
-from binlog_20261122 import FILE_HEADER
-
 
 MAX_BYTES = 16 * 1024 * 1024
 
@@ -22,17 +20,14 @@ def download(port, destination):
     if not header.startswith(b"BIN "):
         raise ValueError(header.decode("ascii", errors="replace"))
     count = int(header[4:])
-    if not len(FILE_HEADER) <= count <= MAX_BYTES:
+    if not 0 < count <= MAX_BYTES:
         raise ValueError("Invalid BIN length")
-    if port.read(len(FILE_HEADER)) != FILE_HEADER:
-        raise ValueError("Incomplete or unsupported PSILOG header")
     # Open exclusively and delete only a partial file created by this download.
     created = False
     try:
         with destination.open("xb") as file:
             created = True
-            file.write(FILE_HEADER)
-            remaining = count - len(FILE_HEADER)
+            remaining = count
             while remaining:
                 chunk = port.read(min(remaining, 4096))
                 if not chunk:

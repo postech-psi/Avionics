@@ -31,6 +31,8 @@ private:
 
 void begin();
 void request(Command command);
+void noteLanding(uint32_t now);
+void tick(uint32_t now);
 void push(uint8_t type, const void* payload, size_t length);
 // Returns true only when a status line is due.
 bool report(char* out, size_t size, uint32_t now);
